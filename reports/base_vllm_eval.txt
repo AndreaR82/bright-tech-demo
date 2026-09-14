@@ -1,0 +1,12 @@
+scoring 224 held-out drafts
+
+=== base Gemma 4 E4B (zero-shot) ===
+accuracy           0.955
+balanced accuracy  0.876
+  recall factual_information            0.995
+  recall personalised_recommendation    0.757  ← the one that matters
+  accuracy on neutral_open             0.727  (n=11)
+  accuracy on original                 0.977  (n=177)
+  accuracy on prefix_factual           1.000  (n=10)
+  accuracy on referral_personal        0.833  (n=12)
+  accuracy on steer_removed            0.929  (n=14)

@@ -1,0 +1,17 @@
+# Secrets
+api-key-claude.txt
+.env
+.env.*
+
+# Data — not published for now (generated DB, product catalogue, drafts, labels)
+data/
+
+# Training outputs: adapters and checkpoints (multi-GB)
+outputs/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/

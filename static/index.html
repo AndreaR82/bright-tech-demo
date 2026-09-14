@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>John's Banking Assistant — behind the scenes</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #151b23; --panel-2: #1b2430; --line: #2a3441;
+    --text: #e6edf3; --muted: #8b98a5;
+    --pass: #3fb950; --block: #f85149; --warn: #d29922; --neutral: #58a6ff;
+    --accent: #7c5cff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text); height: 100vh;
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: grid; grid-template-rows: 1fr auto;
+  }
+  main { display: grid; grid-template-columns: 40fr 60fr; min-height: 0; }
+  section { min-height: 0; display: flex; flex-direction: column; }
+  .head {
+    padding: 14px 18px; border-bottom: 1px solid var(--line); background: var(--panel);
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  }
+  .head h1 { font-size: 19px; margin: 0; font-weight: 650; }
+  .head .sub { color: var(--muted); font-size: 13px; }
+  #chat { border-right: 1px solid var(--line); background: var(--panel); }
+  .scroll { overflow-y: auto; padding: 16px 18px; flex: 1; }
+
+  /* chat */
+  .bubble { max-width: 88%; padding: 11px 14px; border-radius: 14px; margin-bottom: 12px; font-size: 16px; }
+  .bubble.user { background: var(--accent); color: #fff; margin-left: auto; border-bottom-right-radius: 4px; }
+  .bubble.bot { background: var(--panel-2); border: 1px solid var(--line); border-bottom-left-radius: 4px; }
+  .bubble .warn-note { display: block; margin-top: 8px; color: var(--warn); font-size: 13px; }
+  .typing { color: var(--muted); font-size: 14px; font-style: italic; margin-bottom: 12px; }
+
+  /* cards + input */
+  .composer { border-top: 1px solid var(--line); padding: 12px 18px 14px; background: var(--panel); }
+  .cardgroup { margin-bottom: 8px; }
+  .cardgroup h3 { font-size: 12px; color: var(--muted); margin: 6px 0 5px; font-weight: 600; letter-spacing: .3px; }
+  .card {
+    display: inline-block; margin: 0 6px 6px 0; padding: 7px 11px; font-size: 13.5px;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px;
+    color: var(--text); cursor: pointer;
+  }
+  .card:hover { border-color: var(--accent); }
+  .card.think { border-color: var(--accent); }
+  .row-input { display: flex; gap: 8px; margin-top: 6px; }
+  input[type=text] {
+    flex: 1; padding: 12px 14px; font-size: 16px; border-radius: 10px;
+    background: var(--bg); border: 1px solid var(--line); color: var(--text);
+  }
+  button.send, button.reset {
+    padding: 12px 16px; font-size: 15px; border-radius: 10px; cursor: pointer;
+    background: var(--accent); color: #fff; border: 0;
+  }
+  button.reset { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); }
+  .disclaimer { color: var(--muted); font-size: 12px; margin-top: 8px; }
+
+  /* trace */
+  .turn { border: 1px solid var(--line); border-radius: 10px; margin-bottom: 12px; background: var(--panel); }
+  .turn > .turn-head {
+    display: flex; justify-content: space-between; gap: 10px; padding: 10px 13px;
+    border-bottom: 1px solid var(--line); cursor: pointer;
+  }
+  .turn.collapsed > .turn-head { border-bottom: 0; }
+  .turn.collapsed .steps, .turn.collapsed .draftbox { display: none; }
+  .turn-q { font-weight: 600; font-size: 14.5px; }
+  .turn-t { color: var(--muted); font-size: 13px; white-space: nowrap; }
+  table.steps { width: 100%; border-collapse: collapse; font-size: 14px; }
+  table.steps td { padding: 7px 13px; border-bottom: 1px solid #202934; vertical-align: top; }
+  table.steps tr:last-child td { border-bottom: 0; }
+  td.step { width: 30%; font-weight: 550; }
+  td.model { width: 26%; color: var(--muted); font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12.5px; }
+  td.time { width: 12%; color: var(--muted); font-variant-numeric: tabular-nums; }
+  td.outcome { width: 32%; }
+  .badge { padding: 2px 9px; border-radius: 999px; font-size: 13px; white-space: nowrap; }
+  .badge.pass { background: rgba(63,185,80,.15); color: var(--pass); }
+  .badge.block { background: rgba(248,81,73,.15); color: var(--block); }
+  .badge.warn { background: rgba(210,153,34,.16); color: var(--warn); }
+  .badge.neutral { background: rgba(88,166,255,.12); color: var(--neutral); }
+  .detail {
+    display: none; margin: 6px 13px 10px; padding: 9px 11px; background: #0b1017;
+    border: 1px solid var(--line); border-radius: 8px; white-space: pre-wrap;
+    font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12.5px; color: #b9c6d3;
+  }
+  tr.has-detail { cursor: pointer; }
+  .draftbox {
+    margin: 0 13px 12px; padding: 10px 12px; border: 1px dashed var(--line); border-radius: 8px;
+    font-size: 14px; color: #cbd5e1; min-height: 20px; white-space: pre-wrap;
+  }
+  .draftbox .label { display: block; color: var(--muted); font-size: 11.5px; margin-bottom: 5px; letter-spacing: .4px; }
+  .draftbox.blocked { border-color: var(--block); color: var(--block); text-decoration: line-through; }
+  .draftbox.blocked .label { color: var(--block); text-decoration: none; }
+
+  /* bottom strip */
+  footer {
+    border-top: 1px solid var(--line); background: var(--panel-2); padding: 9px 18px;
+    display: flex; justify-content: space-between; align-items: center; gap: 18px; flex-wrap: wrap;
+  }
+  .memline { font-size: 13.5px; color: var(--muted); display: flex; gap: 14px; flex-wrap: wrap; }
+  .memline b { color: var(--text); }
+  .stats { font-size: 13px; color: var(--muted); display: flex; gap: 16px; white-space: nowrap; }
+  .mode-pill { font-size: 12.5px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line); }
+  .mode-eager { color: var(--warn); } .mode-careful { color: var(--pass); }
+</style>
+</head>
+<body>
+<main>
+  <section id="chat">
+    <div class="head">
+      <h1>💬 John's Banking Assistant</h1>
+      <span class="sub" id="bankname"></span>
+    </div>
+    <div class="scroll" id="messages"></div>
+    <div class="composer">
+      <div id="cards"></div>
+      <div class="row-input">
+        <input type="text" id="q" maxlength="300" placeholder="Ask about John's money…" autocomplete="off">
+        <button class="send" id="send">Ask</button>
+        <button class="reset" id="reset" title="Clear for the next visitor">New visitor</button>
+      </div>
+      <div class="disclaimer">Demo only — fictional customer, fictional bank. Please don't enter personal information.</div>
+    </div>
+  </section>
+
+  <section id="trace">
+    <div class="head">
+      <h1>⚙️ Behind the scenes</h1>
+      <span class="sub">every step the assistant takes, live · the writer is eager, the guardrails keep it compliant</span>
+    </div>
+    <div class="scroll" id="steps"></div>
+  </section>
+</main>
+
+<footer>
+  <div class="memline" id="memory">🧠 Booth memory — no conversations yet today</div>
+  <div class="stats">
+    <span id="mode" class="mode-pill">writer: eager</span>
+    <span>🔌 no internet</span><span>☁️ $0.00</span>
+    <span id="tps">⚡ — tok/s</span>
+    <span id="models">🧠 1 model</span>
+  </div>
+</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let currentTurn = null, currentRow = null, timerHandle = null, draftBox = null, busy = false;
+let idleTimer = null, idleSeconds = 90;
+
+function scrollDown(el) { el.scrollTop = el.scrollHeight; }
+
+function addBubble(text, who, warning) {
+  const div = document.createElement('div');
+  div.className = 'bubble ' + who;
+  div.textContent = text;
+  if (warning) {
+    const w = document.createElement('span');
+    w.className = 'warn-note'; w.textContent = '🟡 ' + warning;
+    div.appendChild(w);
+  }
+  $('messages').appendChild(div);
+  scrollDown($('messages'));
+}
+
+function setTyping(on) {
+  let t = document.querySelector('.typing');
+  if (on && !t) {
+    t = document.createElement('div');
+    t.className = 'typing'; t.textContent = 'John’s assistant is working…';
+    $('messages').appendChild(t); scrollDown($('messages'));
+  } else if (!on && t) { t.remove(); }
+}
+
+function newTurn(question) {
+  document.querySelectorAll('.turn').forEach(t => t.classList.add('collapsed'));
+  const turn = document.createElement('div');
+  turn.className = 'turn';
+  turn.innerHTML = `<div class="turn-head"><span class="turn-q"></span><span class="turn-t">running…</span></div>
+                    <table class="steps"></table>`;
+  turn.querySelector('.turn-q').textContent = question;
+  turn.querySelector('.turn-head').onclick = () => turn.classList.toggle('collapsed');
+  $('steps').prepend(turn);
+  currentTurn = turn;
+  draftBox = null;
+}
+
+function startStep(ev) {
+  const table = currentTurn.querySelector('table.steps');
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td class="step"></td><td class="model"></td><td class="time">…</td><td class="outcome"></td>`;
+  tr.querySelector('.step').textContent = ev.step;
+  tr.querySelector('.model').textContent = ev.model;
+  table.appendChild(tr);
+  currentRow = tr;
+  const started = performance.now();
+  clearInterval(timerHandle);
+  timerHandle = setInterval(() => {
+    tr.querySelector('.time').textContent = ((performance.now() - started) / 1000).toFixed(1) + 's';
+  }, 100);
+  scrollDown($('steps'));
+}
+
+function endStep(ev) {
+  clearInterval(timerHandle);
+  if (!currentRow) return;
+  currentRow.querySelector('.time').textContent = ev.seconds.toFixed(1) + 's';
+  currentRow.querySelector('.outcome').innerHTML =
+    `<span class="badge ${ev.badge || 'neutral'}"></span>`;
+  currentRow.querySelector('.badge').textContent = ev.outcome;
+  if (ev.detail && Object.keys(ev.detail).length) {
+    const row = currentRow;
+    row.classList.add('has-detail');
+    const holder = document.createElement('tr');
+    holder.innerHTML = `<td colspan="4" style="padding:0"><div class="detail"></div></td>`;
+    holder.querySelector('.detail').textContent = formatDetail(ev.detail);
+    row.after(holder);
+    row.onclick = () => {
+      const d = holder.querySelector('.detail');
+      d.style.display = d.style.display === 'block' ? 'none' : 'block';
+    };
+  }
+  currentRow = null;
+}
+
+function formatDetail(d) {
+  if (d.sql && d.rows) {
+    const head = d.columns.join(' | ');
+    return d.sql + '\n\n' + head + '\n' + d.rows.map(r => r.join(' | ')).join('\n');
+  }
+  if (d.sql) return d.sql;
+  if (d.claims) return d.claims.map(c => (c.grounded ? '✅ ' : '❌ ') + c.claim).join('\n');
+  if (d.products) return d.products.join('\n');
+  return Object.entries(d).map(([k, v]) => k + ': ' + (typeof v === 'object' ? JSON.stringify(v) : v)).join('\n');
+}
+
+function ensureDraftBox() {
+  if (draftBox) return draftBox;
+  draftBox = document.createElement('div');
+  draftBox.className = 'draftbox';
+  draftBox.innerHTML = '<span class="label">DRAFT — not shown to the customer until it passes the checks</span><span class="text"></span>';
+  currentTurn.appendChild(draftBox);
+  return draftBox;
+}
+
+function handle(ev) {
+  switch (ev.type) {
+    case 'turn_start': newTurn(ev.question); setTyping(true); break;
+    case 'step_start': startStep(ev); break;
+    case 'step_end': endStep(ev); break;
+    case 'draft_token':
+      ensureDraftBox().querySelector('.text').textContent += ev.text;
+      scrollDown($('steps'));
+      break;
+    case 'draft_blocked':
+      if (draftBox) draftBox.classList.add('blocked');
+      draftBox = null;
+      break;
+    case 'message':
+      setTyping(false);
+      addBubble(ev.text, 'bot', ev.warning);
+      break;
+    case 'turn_end':
+      if (currentTurn) currentTurn.querySelector('.turn-t').textContent = 'total ' + ev.seconds.toFixed(1) + 's';
+      setTyping(false); busy = false; $('send').disabled = false; $('q').disabled = false;
+      refreshState(); resetIdle();
+      break;
+  }
+}
+
+async function ask(question) {
+  if (busy || !question.trim()) return;
+  busy = true; $('send').disabled = true; $('q').disabled = true;
+  addBubble(question, 'user');
+  $('q').value = '';
+  const res = await fetch('/api/ask', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question })
+  });
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split('\n\n');
+    buffer = parts.pop();
+    for (const part of parts) {
+      const line = part.trim();
+      if (line.startsWith('data:')) handle(JSON.parse(line.slice(5)));
+    }
+  }
+  busy = false; $('send').disabled = false; $('q').disabled = false;
+}
+
+async function refreshState() {
+  const s = await (await fetch('/api/state')).json();
+  $('bankname').textContent = s.bank_name + ' · ' + s.customer_name + ' · rates as at ' + s.rates_as_at;
+  $('tps').textContent = '⚡ ' + (s.counters.tokens_per_second || '—') + ' tok/s';
+  $('mode').textContent = 'writer: ' + s.mode;
+  $('mode').className = 'mode-pill mode-' + s.mode;
+  idleSeconds = s.idle_reset_seconds;
+  const c = s.counters;
+  const bits = [`🧠 Today: <b>${c.conversations}</b> conversations`, `<b>${c.turns}</b> questions`,
+                `<b>${c.advice_blocked_eager + c.advice_blocked_careful}</b> advice drafts blocked`,
+                `<b>${c.input_blocks}</b> blocked at the door`];
+  if (s.top_topic) bits.push(`top topic: <b>${s.top_topic}</b>`);
+  const recent = s.memory.slice(0, 3).map(m => `#${m.session} ${m.topics.join(', ') || m.summary}`);
+  $('memory').innerHTML = bits.join(' · ') + (recent.length ? '<br>' + recent.join(' · ') : '');
+  if (!s.cards.rendered) renderCards(s);
+}
+
+let cardsRendered = false;
+function renderCards(s) {
+  if (cardsRendered) return;
+  cardsRendered = true;
+  const host = $('cards');
+  host.innerHTML = '';
+  for (const group of s.cards) {
+    const div = document.createElement('div');
+    div.className = 'cardgroup';
+    const h = document.createElement('h3');
+    h.textContent = group.group;
+    div.appendChild(h);
+    for (const item of group.items) {
+      const b = document.createElement('button');
+      b.className = 'card'; b.textContent = item;
+      b.onclick = () => ask(item);
+      div.appendChild(b);
+    }
+    host.appendChild(div);
+  }
+  const think = document.createElement('button');
+  think.className = 'card think'; think.textContent = '🧠 Think hard: ' + s.think_hard_card;
+  think.onclick = () => ask(s.think_hard_card);
+  host.appendChild(think);
+}
+
+function resetIdle() {
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => { if (!busy) newVisitor(); }, idleSeconds * 1000);
+}
+
+async function newVisitor() {
+  await fetch('/api/reset', { method: 'POST' });
+  $('messages').innerHTML = ''; $('steps').innerHTML = '';
+  currentTurn = null; draftBox = null;
+  refreshState();
+}
+
+$('send').onclick = () => ask($('q').value);
+$('q').onkeydown = (e) => { if (e.key === 'Enter') ask($('q').value); };
+$('reset').onclick = newVisitor;
+// Presenter shortcut: ctrl+m flips the writer prompt (guardrails stay on).
+document.onkeydown = async (e) => {
+  if (e.ctrlKey && e.key === 'm') {
+    const s = await (await fetch('/api/state')).json();
+    await fetch('/api/mode', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: s.mode === 'eager' ? 'careful' : 'eager' }) });
+    refreshState();
+  }
+};
+refreshState();
+setInterval(refreshState, 10000);
+</script>
+</body>
+</html>

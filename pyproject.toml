@@ -1,0 +1,14 @@
+[project]
+name = "bright-tech-demo"
+version = "0.1.0"
+description = "Booth demo: a bank assistant for John Citizen with its whole agent pipeline on screen"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "openai>=1.60",
+    "pyyaml>=6.0",
+]
+
+[tool.uv]
+package = false
