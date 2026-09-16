@@ -67,6 +67,7 @@
   .turn.collapsed > .turn-head { border-bottom: 0; }
   .turn.collapsed .steps, .turn.collapsed .draftbox { display: none; }
   .turn-q { font-weight: 600; font-size: 14.5px; }
+  .turn-u { display: block; font-weight: 400; font-size: 13px; color: var(--muted); margin-top: 2px; }
   .turn-t { color: var(--muted); font-size: 13px; white-space: nowrap; }
   table.steps { width: 100%; border-collapse: collapse; font-size: 14px; }
   table.steps td { padding: 7px 13px; border-bottom: 1px solid #202934; vertical-align: top; }
@@ -91,6 +92,7 @@
     font-size: 14px; color: #cbd5e1; min-height: 20px; white-space: pre-wrap;
   }
   .draftbox .label { display: block; color: var(--muted); font-size: 11.5px; margin-bottom: 5px; letter-spacing: .4px; }
+  .draftbox.thinking { color: var(--muted); font-style: italic; border-style: dotted; }
   .draftbox.blocked { border-color: var(--block); color: var(--block); text-decoration: line-through; }
   .draftbox.blocked .label { color: var(--block); text-decoration: none; }
 
@@ -146,8 +148,8 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-let currentTurn = null, currentRow = null, timerHandle = null, draftBox = null, busy = false;
-let idleTimer = null, idleSeconds = 90;
+let currentTurn = null, currentRow = null, timerHandle = null, draftBox = null, thinkBox = null, busy = false;
+let idleTimer = null, idleSeconds = 0;   // 0 = auto-clear disabled
 
 function scrollDown(el) { el.scrollTop = el.scrollHeight; }
 
@@ -184,6 +186,7 @@ function newTurn(question) {
   $('steps').prepend(turn);
   currentTurn = turn;
   draftBox = null;
+  thinkBox = null;
 }
 
 function startStep(ev) {
@@ -244,11 +247,31 @@ function ensureDraftBox() {
   return draftBox;
 }
 
+function ensureThinkBox() {
+  if (thinkBox) return thinkBox;
+  thinkBox = document.createElement('div');
+  thinkBox.className = 'draftbox thinking';
+  thinkBox.innerHTML = '<span class="label">THINKING — the model working it out, never shown to the customer</span><span class="text"></span>';
+  currentTurn.appendChild(thinkBox);
+  return thinkBox;
+}
+
 function handle(ev) {
   switch (ev.type) {
     case 'turn_start': newTurn(ev.question); setTyping(true); break;
+    case 'understood': {
+      const u = document.createElement('span');
+      u.className = 'turn-u'; u.textContent = '↳ understood as: ' + ev.text;
+      currentTurn.querySelector('.turn-q').appendChild(u);
+      break;
+    }
     case 'step_start': startStep(ev); break;
     case 'step_end': endStep(ev); break;
+    case 'think_token':
+      ensureThinkBox().querySelector('.text').textContent += ev.text;
+      scrollDown($('steps'));
+      break;
+    case 'think_done': thinkBox = null; break;
     case 'draft_token':
       ensureDraftBox().querySelector('.text').textContent += ev.text;
       scrollDown($('steps'));
@@ -269,14 +292,14 @@ function handle(ev) {
   }
 }
 
-async function ask(question) {
+async function ask(question, thinkHard = false) {
   if (busy || !question.trim()) return;
   busy = true; $('send').disabled = true; $('q').disabled = true;
   addBubble(question, 'user');
   $('q').value = '';
   const res = await fetch('/api/ask', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question })
+    body: JSON.stringify({ question, think_hard: thinkHard })
   });
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -334,12 +357,13 @@ function renderCards(s) {
   }
   const think = document.createElement('button');
   think.className = 'card think'; think.textContent = '🧠 Think hard: ' + s.think_hard_card;
-  think.onclick = () => ask(s.think_hard_card);
+  think.onclick = () => ask(s.think_hard_card, true);
   host.appendChild(think);
 }
 
 function resetIdle() {
   clearTimeout(idleTimer);
+  if (!(idleSeconds > 0)) return;   // 0 or null = never auto-clear; the booth waits for "New visitor"
   idleTimer = setTimeout(() => { if (!busy) newVisitor(); }, idleSeconds * 1000);
 }
 

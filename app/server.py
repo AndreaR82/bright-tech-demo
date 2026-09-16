@@ -2,7 +2,7 @@
 
 Endpoints
     GET  /               the booth page
-    POST /api/ask        {question} → SSE stream of trace events
+    POST /api/ask        {question, think_hard} → SSE stream of trace events
     POST /api/reset      end the visitor's session, compact it into booth memory
     POST /api/mode       presenter switch: eager | careful
     GET  /api/state      cards, counters, booth memory, health
@@ -60,6 +60,8 @@ def redact(text: str) -> str:
 
 class Ask(BaseModel):
     question: str
+    # The Think hard card: the writer runs with Gemma's thinking mode on. Only the
+    # writer — every check keeps its JSON-constrained decoding.
     think_hard: bool = False
 
 
@@ -85,7 +87,7 @@ def ask(body: Ask) -> StreamingResponse:
             yield sse({"type": "turn_end", "seconds": 0})
             return
         try:
-            for event in pipeline.run_turn(question, SESSION, mode=MODE):
+            for event in pipeline.run_turn(question, SESSION, mode=MODE, think_hard=body.think_hard):
                 yield sse(event)
         except Exception as exc:  # never leave a visitor looking at a frozen screen
             yield sse({"type": "message", "role": "assistant",

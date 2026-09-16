@@ -10,6 +10,7 @@ model decides *how* to answer; this file decides *that it gets checked*.
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -41,9 +42,11 @@ INPUT_SCHEMA = {
     "additionalProperties": False,
 }
 
+# `standalone` comes first so the model resolves the follow-up before it routes.
 ROUTE_SCHEMA = {
     "type": "object",
     "properties": {
+        "standalone": {"type": "string", "maxLength": 300},
         "specialist": {"type": "string", "enum": ["spending_analyst", "product_advisor", "small_talk"]},
         "reason": {"type": "string", "maxLength": 90},
         "follow_up": {"type": "string", "maxLength": 40},
@@ -63,17 +66,22 @@ SQL_ACTION_SCHEMA = {
     "additionalProperties": False,
 }
 
+# Every field is required: the agent steps decode through a compact regex that emits
+# all of them in this order (llm.compact_json_regex), so unused ones come back as ""
+# or 0. The maximums matter: they are what ends a number in that regex. Arguments
+# come before the note, so a rambling note can't eat the token budget first.
 PRODUCT_ACTION_SCHEMA = {
     "type": "object",
     "properties": {
         "action": {"type": "string", "enum": ["search", "repayment", "borrowing_power", "finish"]},
         "query": {"type": "string", "maxLength": 120},
-        "principal": {"type": "number"},
-        "annual_rate_pct": {"type": "number"},
-        "years": {"type": "integer"},
+        "principal": {"type": "number", "minimum": 0, "maximum": 99_999_999},
+        "annual_rate_pct": {"type": "number", "minimum": 0, "maximum": 30},
+        # Not "years": the model filled that with the fixed period ("3 year fixed" → 3).
+        "loan_term_years": {"type": "integer", "minimum": 0, "maximum": 40},
         "note": {"type": "string", "maxLength": 120},
     },
-    "required": ["action", "note"],
+    "required": ["action", "query", "principal", "annual_rate_pct", "loan_term_years", "note"],
     "additionalProperties": False,
 }
 
@@ -125,12 +133,29 @@ class Session:
     number: int = 1
     turn: int = 0
     history: list[dict[str, str]] = field(default_factory=list)
+    # One entry per released answer: what was asked, how the router understood it,
+    # and the tool results behind it — so a follow-up builds on the data, not just
+    # on the prose. Questions blocked at the door never land here.
+    turns: list[dict[str, Any]] = field(default_factory=list)
     topics: list[str] = field(default_factory=list)
     started: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)
 
     def transcript(self, limit: int = 6) -> list[dict[str, str]]:
         return self.history[-limit * 2 :]
+
+    def conversation(self, limit: int = 3) -> str:
+        """Earlier turns as plain text, for the stages that answer in JSON — chat
+        turns full of prose would show a 4B model the wrong reply format."""
+        return "\n".join(
+            f"Customer: {t['question']}\nAssistant: {t['answer']}" for t in self.turns[-limit:]
+        )
+
+    def earlier_data(self, limit: int = 2) -> str:
+        """The tool results behind recent answers, each labelled with its question."""
+        return "\n\n".join(
+            f'For "{t["standalone"]}":\n{t["document"]}' for t in self.turns[-limit:] if t["facts"]
+        )
 
 
 @dataclass
@@ -173,6 +198,14 @@ def _sentences(text: str) -> list[str]:
     return [s.strip() for s in _SENTENCE_RE.split(text.strip()) if s.strip()]
 
 
+def _cell(value: Any) -> str:
+    """One SQL value. Money gets its whole-dollar rounding alongside: the writer is told
+    to round to whole dollars, and the judge otherwise rejects "$78,241" for 78240.55."""
+    if isinstance(value, float) and abs(value) >= 100 and value != round(value):
+        return f"{value} (≈ {round(value):,})"
+    return str(value)
+
+
 def _render_facts(facts: list[dict[str, Any]]) -> str:
     """Tool results as a plain-text document — the writer's only source, and the
     fact checker's Document."""
@@ -182,7 +215,7 @@ def _render_facts(facts: list[dict[str, Any]]) -> str:
             r = f["result"]
             if r.get("ok"):
                 header = " | ".join(str(c) for c in r["columns"])
-                rows = "\n".join(" | ".join(str(v) for v in row) for row in r["rows"])
+                rows = "\n".join(" | ".join(_cell(v) for v in row) for row in r["rows"])
                 out.append(f"Query: {f['result']['sql']}\n{header}\n{rows}")
         elif f["kind"] == "products":
             for p in f["result"]["products"]:
@@ -197,6 +230,29 @@ def _render_facts(facts: list[dict[str, Any]]) -> str:
             r = {k: v for k, v in f["result"].items() if k not in ("ok", "seconds")}
             out.append(f"Calculator ({f['name']}): " + ", ".join(f"{k} = {v}" for k, v in r.items()))
     return "\n\n".join(out) if out else "(no data was retrieved)"
+
+
+def _with_context(question: str, session: Session, data: bool = False) -> str:
+    """The question, preceded by the conversation so far (and, for the specialists,
+    the tool results behind it)."""
+    parts = []
+    if session.turns:
+        parts.append("Conversation so far:\n" + session.conversation())
+        if data and (earlier := session.earlier_data()):
+            parts.append("Data fetched earlier in this conversation:\n" + earlier)
+    parts.append(f"Question: {question}")
+    return "\n\n".join(parts)
+
+
+def _document(facts: list[dict[str, Any]], session: Session) -> str:
+    """This turn's tool results plus the recent turns' — the writer's source and the
+    fact checker's Document, so a number from an earlier answer still counts as
+    grounded when a follow-up refers back to it."""
+    earlier = session.earlier_data()
+    if not earlier:
+        return _render_facts(facts)
+    current = _render_facts(facts) if facts else "(nothing new was fetched for this question)"
+    return f"{current}\n\nFrom earlier in this conversation:\n{earlier}"
 
 
 # -------------------------------------------------------------------- stages ---
@@ -225,18 +281,23 @@ def _done(seconds: float, outcome: str, badge: str = "pass", detail: Any = None)
 def _spending_agent(question: str, session: Session) -> Iterator[dict[str, Any]]:
     """Agentic: the model writes SQL, reads the result, decides whether to go again."""
     facts: list[dict[str, Any]] = []
-    messages = [{"role": "system", "content": _prompt("spending_analyst")}]
-    messages += session.transcript(2)
-    messages.append({"role": "user", "content": question})
+    messages = [
+        {"role": "system", "content": _prompt("spending_analyst")},
+        {"role": "user", "content": _with_context(question, session, data=True)},
+    ]
 
     for _ in range(CFG["limits"]["max_tool_calls"]):
         yield _step("Spending Analyst", llm.BASE_MODEL)
         # Generous cap: constrained JSON that truncates mid-string is unparseable,
         # and a 4B model occasionally pads. Unused tokens cost nothing.
-        c = llm.complete(messages, schema=SQL_ACTION_SCHEMA, max_tokens=600)
+        c = llm.complete(messages, schema=SQL_ACTION_SCHEMA, compact=True, max_tokens=600)
         COUNTERS.tokens += c.completion_tokens
         if c.error or not c.data:
-            yield _done(c.seconds, "⚠️ model error", "warn", {"error": c.error})
+            # Same as the product agent: once a query has returned rows, keep them.
+            if facts:
+                yield _done(c.seconds, "done", "neutral", {"note": "stopped after an unreadable step", "error": c.error})
+            else:
+                yield _done(c.seconds, "⚠️ model error", "warn", {"error": c.error})
             break
         action = c.data
         if action["action"] == "finish" or not action.get("sql"):
@@ -262,16 +323,22 @@ def _spending_agent(question: str, session: Session) -> Iterator[dict[str, Any]]
 
 def _product_agent(question: str, session: Session) -> Iterator[dict[str, Any]]:
     facts: list[dict[str, Any]] = []
-    messages = [{"role": "system", "content": _prompt("product_advisor")}]
-    messages += session.transcript(2)
-    messages.append({"role": "user", "content": question})
+    messages = [
+        {"role": "system", "content": _prompt("product_advisor")},
+        {"role": "user", "content": _with_context(question, session, data=True)},
+    ]
 
     for _ in range(CFG["limits"]["max_tool_calls"]):
         yield _step("Product Advisor", llm.BASE_MODEL)
-        c = llm.complete(messages, schema=PRODUCT_ACTION_SCHEMA, max_tokens=400)
+        c = llm.complete(messages, schema=PRODUCT_ACTION_SCHEMA, compact=True, max_tokens=400)
         COUNTERS.tokens += c.completion_tokens
         if c.error or not c.data:
-            yield _done(c.seconds, "⚠️ model error", "warn", {"error": c.error})
+            # After a tool has answered, a garbled step can only have been "finish" or
+            # one call too many — what's gathered stands, so don't flag it as a failure.
+            if facts:
+                yield _done(c.seconds, "done", "neutral", {"note": "stopped after an unreadable step", "error": c.error})
+            else:
+                yield _done(c.seconds, "⚠️ model error", "warn", {"error": c.error})
             break
         action = c.data
         kind = action["action"]
@@ -291,15 +358,19 @@ def _product_agent(question: str, session: Session) -> Iterator[dict[str, Any]]:
             result = tools.loan_repayment(
                 float(action.get("principal") or 500000),
                 float(action.get("annual_rate_pct") or 5.94),
-                int(action.get("years") or 30),
+                int(action.get("loan_term_years") or 30),
             )
             yield _done(result["seconds"], f"${result['monthly_repayment']:,.0f}/mo", "neutral", result)
             facts.append({"kind": "calculator", "name": "repayment", "result": result})
         else:  # borrowing_power
             yield _step("Loan calculator", None, kind="tool")
+            # Living expenses for a first-home buyer: rent stops when the mortgage starts,
+            # and the car loan is passed separately as debt, so neither counts here —
+            # counting both left John with a negative surplus and a $0 answer.
             spend = tools.run_sql(
                 "SELECT ROUND(AVG(m),2) FROM (SELECT strftime('%Y-%m',txn_date) k, SUM(-amount) m"
-                " FROM transactions WHERE amount<0 AND category NOT IN ('savings_transfer','credit_card_payment')"
+                " FROM transactions WHERE amount<0"
+                " AND category NOT IN ('savings_transfer','credit_card_payment','rent','loan_repayment')"
                 " AND txn_date >= date('now','-6 months') GROUP BY k)"
             )
             monthly_expenses = (spend["rows"][0][0] if spend.get("ok") and spend["rows"] else 3500.0) or 3500.0
@@ -307,7 +378,9 @@ def _product_agent(question: str, session: Session) -> Iterator[dict[str, Any]]:
             yield _done(result["seconds"], f"max ${result['max_loan']:,.0f}", "neutral", result)
             facts.append({"kind": "calculator", "name": "borrowing_power", "result": result})
 
-        messages.append({"role": "assistant", "content": f"{kind}: {action.get('note','')}"})
+        # Echo the arguments, not just the note, so the next step knows what it asked for.
+        args = {k: action[k] for k in ("query", "principal", "annual_rate_pct", "loan_term_years") if action.get(k)}
+        messages.append({"role": "assistant", "content": f"{kind} {json.dumps(args)}: {action.get('note', '')}"})
         messages.append({"role": "user", "content": f"Result:\n{_render_facts([facts[-1]])}\n\nAnother tool, or finish?"})
 
     yield {"type": "facts", "facts": facts}
@@ -353,27 +426,61 @@ def _draft(
     mode: str,
     extra: str = "",
     temperature: float = 0.0,
+    standalone: str | None = None,
+    thinking: bool = False,
 ) -> Iterator[Any]:
     """Streams tokens; the last yielded value is the finished text.
 
     `temperature` stays 0 at the booth (same question → same answer, which matters
     when a visitor retries). Training-data generation raises it for variety.
+    `standalone` is the router's rewrite of a follow-up; the writer answers the
+    visitor's own words, with the rewrite alongside to say what they meant.
+    `thinking` runs the writer with Gemma's thinking mode on — the Think hard
+    card. The scratchpad streams into the panel as its own step and is never part
+    of the draft the checks see.
     """
     system = _prompt("writer_careful" if mode == "careful" else "writer_eager")
     messages = [{"role": "system", "content": system}]
     messages += session.transcript(3)
-    messages.append({"role": "user", "content": f"Question: {question}\n\nData you may use:\n{document}{extra}"})
+    asked = f"Question: {question}"
+    if standalone and standalone != question:
+        asked += f"\n(He means: {standalone})"
+    messages.append({"role": "user", "content": f"{asked}\n\nData you may use:\n{document}{extra}"})
     pieces: list[str] = []
-    for piece in llm.stream(messages, max_tokens=200, temperature=temperature):
-        pieces.append(piece)
-        yield {"type": "draft_token", "text": piece}
-    yield {"type": "draft_text", "text": "".join(pieces).strip()}
+    if not thinking:
+        for piece in llm.stream(messages, max_tokens=200, temperature=temperature):
+            pieces.append(piece)
+            yield {"type": "draft_token", "text": piece}
+    else:
+        thought: list[str] = []
+        answered = False
+        for channel, piece in llm.stream_parts(messages, temperature=temperature):
+            if channel == "think":
+                thought.append(piece)
+                yield {"type": "think_token", "text": piece}
+                continue
+            if not answered:
+                answered = True
+                yield {"type": "think_done", "text": "".join(thought)}
+            pieces.append(piece)
+            yield {"type": "draft_token", "text": piece}
+        if not answered:
+            # No scratchpad marker and no reasoning_content: what looked like
+            # thinking was the answer all along. Keep the answer, say so.
+            yield {"type": "think_done", "text": ""}
+            fallback = "".join(thought)
+            pieces.append(fallback)
+            yield {"type": "draft_token", "text": fallback}
+    # Gemma sometimes escapes dollar signs as if writing LaTeX; the chat shows raw text.
+    yield {"type": "draft_text", "text": "".join(pieces).strip().replace("\\$", "$")}
 
 
 # ---------------------------------------------------------------- the turn ---
 
 
-def run_turn(question: str, session: Session, mode: str | None = None) -> Iterator[dict[str, Any]]:
+def run_turn(
+    question: str, session: Session, mode: str | None = None, think_hard: bool = False
+) -> Iterator[dict[str, Any]]:
     mode = mode or CFG.get("writer_mode", "eager")
     turn_started = time.monotonic()
     session.turn += 1
@@ -384,18 +491,22 @@ def run_turn(question: str, session: Session, mode: str | None = None) -> Iterat
 
     # 1 + 2. Input check and routing run in parallel: the check is never skipped,
     # and the router's answer is simply thrown away if the question is blocked.
+    # The check always screens the visitor's raw words — never the router's rewrite —
+    # with the previous question as context so "and last year?" isn't off topic.
+    screened = question
+    if session.turns:
+        screened = f"Previous question (context only): {session.turns[-1]['question']}\n\nNew question: {question}"
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
     check_future = pool.submit(
         llm.complete,
-        [{"role": "system", "content": _prompt("input_check")}, {"role": "user", "content": question}],
+        [{"role": "system", "content": _prompt("input_check")}, {"role": "user", "content": screened}],
         schema=INPUT_SCHEMA, max_tokens=110,
     )
     route_future = pool.submit(
         llm.complete,
         [{"role": "system", "content": _prompt("router")},
-         *session.transcript(2),
-         {"role": "user", "content": question}],
-        schema=ROUTE_SCHEMA, max_tokens=110,
+         {"role": "user", "content": _with_context(question, session)}],
+        schema=ROUTE_SCHEMA, compact=True, max_tokens=260,
     )
 
     yield _step("Input check", llm.BASE_MODEL)
@@ -417,28 +528,52 @@ def run_turn(question: str, session: Session, mode: str | None = None) -> Iterat
     COUNTERS.tokens += c.completion_tokens
     route = (c.data or {}).get("specialist", "spending_analyst")
     follow_up = (c.data or {}).get("follow_up", "").strip()
+    # A first question has nothing to resolve, so it is never rewritten.
+    standalone = question
+    if session.turns and route != "small_talk":
+        rewrite = " ".join(str((c.data or {}).get("standalone", "")).split())[:300]
+        # A rewrite with no real words ("," has been seen) would be worse than none.
+        if len(re.findall(r"[A-Za-z]{2,}", rewrite)) >= 2:
+            standalone = rewrite
+    if not session.turns:
+        follow_up = ""
     label = {"spending_analyst": "Spending Analyst", "product_advisor": "Product Advisor", "small_talk": "Small talk"}[route]
-    yield _done(c.seconds, f"→ {label}" + (f" ↩︎ {follow_up}" if follow_up else ""), "neutral",
-                {"reason": (c.data or {}).get("reason")})
+    detail = {"reason": (c.data or {}).get("reason")}
+    if standalone != question:
+        detail["standalone"] = standalone
+    yield _done(c.seconds, f"→ {label}" + (f" ↩︎ {follow_up}" if follow_up else ""), "neutral", detail)
+    if standalone != question:
+        yield {"type": "understood", "text": standalone}
 
-    # 3. Specialist — the agentic part.
+    # 3. Specialist — the agentic part, working from the standalone question.
     facts: list[dict[str, Any]] = []
     if route in ("spending_analyst", "product_advisor"):
         agent = _spending_agent if route == "spending_analyst" else _product_agent
-        for event in agent(question, session):
+        for event in agent(standalone, session):
             if event["type"] == "facts":
                 facts = event["facts"]
             else:
                 yield event
-    document = _render_facts(facts)
+    document = _document(facts, session)
 
     # 4. Draft — streams into the panel only. Nothing reaches the chat unchecked.
-    yield _step("Draft answer", llm.BASE_MODEL)
+    # The Think hard card runs the writer with thinking on: the scratchpad gets its
+    # own row and its own timer, then the draft streams as usual. Everything after
+    # this point is identical, thinking or not — the checks see only the draft.
+    yield _step("Thinking" if think_hard else "Draft answer", llm.BASE_MODEL)
     draft_started = time.monotonic()
     draft = ""
-    for event in _draft(question, document, session, mode):
+    for event in _draft(question, document, session, mode, standalone=standalone,
+                        thinking=think_hard):
         if event["type"] == "draft_text":
             draft = event["text"]
+        elif event["type"] == "think_done":
+            words = len(event["text"].split())
+            yield _done(time.monotonic() - draft_started,
+                        f"🧠 thought it through ({words} words)" if words else "🧠 no scratchpad returned",
+                        "neutral", {"thinking": event["text"]} if words else None)
+            yield _step("Draft answer", llm.BASE_MODEL)
+            draft_started = time.monotonic()
         else:
             yield event
     yield _done(time.monotonic() - draft_started, "✍️ Done", "neutral", None)
@@ -493,7 +628,8 @@ def run_turn(question: str, session: Session, mode: str | None = None) -> Iterat
         yield _step("Rewrite", llm.BASE_MODEL)
         rewrite_started = time.monotonic()
         rewritten = ""
-        for event in _draft(question, document, session, "careful", extra="\n\nProblems with your first draft:\n" + "\n".join(notes)):
+        for event in _draft(question, document, session, "careful", standalone=standalone,
+                            extra="\n\nProblems with your first draft:\n" + "\n".join(notes)):
             if event["type"] == "draft_text":
                 rewritten = event["text"]
             else:
@@ -515,6 +651,8 @@ def run_turn(question: str, session: Session, mode: str | None = None) -> Iterat
     warning = "General information only — not a recommendation." if route == "product_advisor" else None
     session.history.append({"role": "user", "content": question})
     session.history.append({"role": "assistant", "content": draft})
+    session.turns.append({"question": question, "standalone": standalone, "route": route,
+                          "answer": draft, "facts": facts, "document": _render_facts(facts)})
     if follow_up:
         session.topics.append(follow_up)
 
