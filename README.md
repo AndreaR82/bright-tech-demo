@@ -49,15 +49,6 @@ anything that does not ask for one (bf16 unless you say otherwise).
 The FP8 server is optional. With it down the ⚡ pill greys out, every turn runs
 in bf16, and preflight still goes green.
 
-**Measured** ([reports/fp8_vs_bf16.md](reports/fp8_vs_bf16.md)): bf16 19.1 →
-FP8 35.6 tok/s at batch size 1 (**1.86x**), 33.2 with the advice adapter loaded.
-Weights 11.19 GiB against 15.26. Quantizable linears are only 49% of this
-checkpoint — the per-layer embedding tables are another 36% and stay bf16 — so
-~1.8x is the ceiling, not 2x. On the 224-row test split the adapter scores
-**identically** at both precisions (0.973 recall on `personalised_recommendation`,
-every counterfactual slice unchanged); the base model loses a little (0.757 →
-0.730), so the fine-tune bought robustness to quantization as well as accuracy.
-
 **Warm it up before the doors open.** The first few FP8 requests run at roughly
 bf16 speed while Cutlass and Triton autotune; after ~5 calls it settles. Its
 torch.compile cache key differs from the bf16 server's, so a cold start compiles
@@ -86,6 +77,8 @@ year one?" — run `uv run python scripts/eval_multiturn.py`.
 | **Ctrl+M** | flips the writer prompt: eager ↔ careful (guardrails stay on either way) |
 | ⚡ **FP8** toggle | sends the next question to the FP8 endpoint on :8001 instead of bf16 on :8000. Per-question, so a click never splits a turn. Greyed out when :8001 is down. The footer keeps a running `bf16 … · fp8 …` tok/s comparison that survives **New visitor** |
 | 🧠 **Think hard** card | writer runs with Gemma's thinking mode on (~40 s); the scratchpad shows in the trace, never in the chat |
+| 💾 **Save to John's memory** | commits the customer-memory box (lower right) to `data/customer_memory.json`. Only saved memory is read back into later conversations, so this button is the moment memory becomes real. Greyed out when nothing has changed since the last save |
+| 🗑️ **Forget** | wipes John's file and the box. Do this between demos if a visitor has taken his profile somewhere odd |
 | `app/config.yaml` | prompts, cards, limits — edit, then restart the server (it is read once at import) |
 
 ## Layout
@@ -96,12 +89,14 @@ app/
   llm.py        vLLM client (timings + tokens per call)
   tools.py      SQL (scoped to John), product search, loan maths
   pipeline.py   the agent: input check → route → specialist → draft → checks
+  memory.py     customer memory: John's profile, saved to disk and read back
   server.py     FastAPI + SSE + booth memory
 static/index.html   the booth page (no build step)
 scripts/        generate_data.py, preflight.py, eval_multiturn.py, and the
                 fine-tuning pipeline (gen_drafts → label → build → eval)
-data/           bank.db (generated), products.json (hand-written catalogue)
-                — all of data/ is gitignored, so a fresh clone needs
+data/           bank.db (generated), products.json (hand-written catalogue),
+                customer_memory.json (John's saved profile, written by the
+                booth) — all of data/ is gitignored, so a fresh clone needs
                 products.json put back before the server will import
 ```
 
@@ -112,8 +107,10 @@ data/           bank.db (generated), products.json (hand-written catalogue)
   model; the advice detector is served and wired up (`VLLM_ADVICE_MODEL=advice`)
 - recording fallback for the "vLLM died mid-event" case
 - EmbeddingGemma for product search; speculative decoding for speed
-- `--max-loras` is still 1 on both servers. Not a problem today — one adapter is
-  served — but the judge adapter will need it raised
+- FP8 + the advice LoRA is erratic at batch size 1 (14–32 tok/s against a steady
+  18 on bf16), while FP8 on the base model is a clean 1.81x. Worth chasing:
+  `cudagraph_specialize_lora` and the adapter-swap path between base and LoRA
+  requests
 
 The advice definitions in `app/config.yaml` are written up from ASIC's guidance
 and verified against primary sources (12 Sep 2026), with the reasoning and the

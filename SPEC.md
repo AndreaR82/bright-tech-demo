@@ -30,6 +30,10 @@ readable by both.
 │  💬 John's Banking Assistant │  ⚙️ Behind the scenes                          │
 │  chat (~40%)                 │  trace rows (~60%)                            │
 │  question cards + input      │  Step | Model | Time | Outcome                │
+│                              ├───────────────────────────────────────────────┤
+│                              │ 🧠 What we remember about John                 │
+│                              │ Goals · Circumstances · Preferences · Looking │
+│                              │ [💾 Save to John's memory] [🗑️ Forget]        │
 ├──────────────────────────────┴───────────────────────────────────────────────┤
 │ 🧠 Today: N conversations · M advice drafts blocked · top topic …            │
 │ #34 dining + fixed/variable · #33 borrowing power   🔌 no internet ☁️ $0.00   │
@@ -122,12 +126,30 @@ the answer exactly as they do on every other card.
   topics}` shown in the bottom strip ticker; the guardrail counters live beside
   it, outside the card. Redacted, checked before display, **never fed back into
   the chat** (prompt-injection path). Deleted at the end of the event.
+- **Customer memory**: what the assistant knows about *John*, in the box at the
+  bottom right. One extraction call after each released answer merges the turn into
+  a four-field profile — goals, circumstances, preferences, what he is looking at —
+  and the box shows the changed fields accented. The call runs *after* the answer is
+  already in the chat, so it never delays a reply.
+  Deliberately the opposite posture to booth memory: **not anonymous and not
+  redacted**, because a profile with its amounts stripped out is not a profile, and
+  John is synthetic. What guards it instead is the save step. A turn only updates the
+  *pending* profile; **nothing is read back until someone presses Save**, and the
+  profile passes the input guardrail on the way to disk, so a poisoned field cannot
+  reach a later prompt. Saved memory is prepended to the router, the specialists and
+  the writer (as background — the tool results stay the only source of numbers), and
+  shows as a "Customer memory" row at the top of the turn. It survives **New visitor**
+  and a restart: that persistence is the point. `data/customer_memory.json`, wiped by
+  the 🗑️ Forget button and at the end of the event.
+  Note it does not buy a bypass: with the profile loaded, "Which loan should I pick?"
+  is still blocked by the advice check and rewritten. Worth narrating at the booth.
 
 ## Non-goals / deliberate exclusions
 
 - No "break the bot" challenge (separate demo), no guardrails-OFF switch, no
-  visitor phones, no React build step, no request logging to disk beyond booth
-  memory summaries, no real bank data or branding.
+  visitor phones, no React build step, no real bank data or branding.
+- Nothing is logged to disk beyond booth-memory summaries and John's saved
+  customer-memory profile — no transcripts, no per-request logs.
 
 ## Runtime
 
@@ -147,9 +169,8 @@ Stretch, in order: EmbeddingGemma, speculative decoding.
 
 FP8 is done: a second vLLM server on :8001 holds the same weights and the same
 advice adapter quantized to FP8, and the ⚡ pill picks between them per question.
-Measured at batch size 1, 128 tokens, after warm-up, on an otherwise idle box:
-**bf16 19.1 tok/s → FP8 35.6 tok/s (1.86x)** on the base model, and **18.2 → 33.2
-(1.82x)** with the advice adapter loaded. Quantizable linears are only 49% of the
+Measured at batch size 1, 128 tokens, after warm-up: **bf16 19.2 tok/s → FP8 34.8
+tok/s (1.81x)** on the base model. Quantizable linears are only 49% of the
 checkpoint — the per-layer embedding tables are another 36% and do not quantize —
 so ~1.8x is the ceiling here, not 2x. See README for the launch flags.
 

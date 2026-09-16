@@ -103,6 +103,32 @@
   .draftbox.blocked { border-color: var(--block); color: var(--block); text-decoration: line-through; }
   .draftbox.blocked .label { color: var(--block); text-decoration: none; }
 
+  /* customer memory, lower right */
+  .memcard {
+    flex: 0 0 auto; max-height: 34%; overflow-y: auto;
+    border-top: 1px solid var(--line); background: var(--panel-2); padding: 12px 18px 14px;
+  }
+  .memcard h2 { font-size: 13px; color: var(--text); margin: 0; font-weight: 600; }
+  .memcard .sub { display: block; color: var(--muted); font-size: 11.5px; margin: 2px 0 9px; }
+  .memrow { display: grid; grid-template-columns: 112px 1fr; gap: 10px; padding: 3px 0; font-size: 13.5px; }
+  .memrow .k { color: var(--muted); }
+  .memrow .v { color: #cbd5e1; }
+  .memrow .v:empty::after { content: "—"; color: var(--line); }
+  .memrow.changed .v { color: var(--accent); }
+  .memrow.changed .k::before { content: "• "; color: var(--accent); }
+  .memfoot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 9px; }
+  .memfoot .card { margin: 0; font-size: 12.5px; padding: 6px 10px; }
+  .memfoot .note { color: var(--muted); font-size: 12px; }
+  .memfoot .note.ok { color: var(--pass); }
+  .memfoot .note.bad { color: var(--block); }
+  .memjson {
+    display: none; margin-top: 9px; padding: 9px 11px; background: #0b1017;
+    border: 1px solid var(--line); border-radius: 8px; white-space: pre-wrap;
+    font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; color: #b9c6d3;
+  }
+  .memtoggle { background: none; border: 0; padding: 0; color: var(--muted); font-size: 12px; cursor: pointer; }
+  .memcard.blocked { border-top-color: var(--block); }
+
   /* bottom strip */
   footer {
     border-top: 1px solid var(--line); background: var(--panel-2); padding: 9px 18px;
@@ -140,6 +166,7 @@
       <span class="sub">every step the assistant takes, live · the writer is eager, the guardrails keep it compliant</span>
     </div>
     <div class="scroll" id="steps"></div>
+    <div class="memcard" id="custmem"></div>
   </section>
 </main>
 
@@ -322,6 +349,10 @@ function handle(ev) {
       if (draftBox) draftBox.classList.add('blocked');
       draftBox = null;
       break;
+    case 'customer_memory':
+      memNote = null;                  // a new turn supersedes the last save message
+      renderCustomerMemory(ev);
+      break;
     case 'message':
       setTyping(false);
       addBubble(ev.text, 'bot', ev.warning);
@@ -397,6 +428,7 @@ async function refreshState() {
   if (s.top_topic) bits.push(`top topic: <b>${s.top_topic}</b>`);
   const recent = s.memory.slice(0, 3).map(m => `#${m.session} ${m.topics.join(', ') || m.summary}`);
   $('memory').innerHTML = bits.join(' · ') + (recent.length ? '<br>' + recent.join(' · ') : '');
+  renderCustomerMemory(s.customer_memory);
   if (!s.cards.rendered) renderCards(s);
 }
 
@@ -438,6 +470,79 @@ function renderCards(s) {
   host.appendChild(row);
   setThinkHard(thinkHard);
   setPrecision(precision);
+}
+
+// Customer memory: what the assistant remembers about John, built turn by turn.
+// `pending` is what the last turn extracted; only `saved` is ever read back into a
+// prompt, so the Save button is the moment memory becomes real.
+let memLabels = null, memState = null, memJsonOpen = false, memNote = null;
+
+function renderCustomerMemory(m) {
+  if (!m) return;
+  if (m.labels) memLabels = m.labels;
+  memState = { saved: m.saved, pending: m.pending, changed: m.changed || [] };
+  if (!memLabels) return;                       // /api/state hasn't landed yet
+  const host = $('custmem');
+  host.className = 'memcard' + (memNote && memNote.bad ? ' blocked' : '');
+  host.innerHTML = '';
+
+  const h = document.createElement('h2');
+  h.textContent = memLabels.title;
+  const sub = document.createElement('span');
+  sub.className = 'sub'; sub.textContent = memLabels.subtitle;
+  host.appendChild(h); host.appendChild(sub);
+
+  for (const [field, label] of Object.entries(memLabels.labels)) {
+    const row = document.createElement('div');
+    row.className = 'memrow' + (memState.changed.includes(field) ? ' changed' : '');
+    row.innerHTML = '<span class="k"></span><span class="v"></span>';
+    row.querySelector('.k').textContent = label;
+    row.querySelector('.v').textContent = memState.pending[field] || '';
+    host.appendChild(row);
+  }
+
+  const foot = document.createElement('div');
+  foot.className = 'memfoot';
+  const save = document.createElement('button');
+  save.className = 'card'; save.textContent = '💾 Save to John\'s memory';
+  save.disabled = memState.changed.length === 0;
+  save.title = save.disabled ? 'Nothing new since the last save' : 'Write these to John\'s file';
+  save.onclick = saveMemory;
+  const forget = document.createElement('button');
+  forget.className = 'card'; forget.textContent = '🗑️ Forget';
+  forget.onclick = forgetMemory;
+  const toggle = document.createElement('button');
+  toggle.className = 'memtoggle';
+  toggle.textContent = (memJsonOpen ? '▾' : '▸') + ' the JSON that gets saved';
+  toggle.onclick = () => { memJsonOpen = !memJsonOpen; renderCustomerMemory(memState); };
+  foot.appendChild(save); foot.appendChild(forget); foot.appendChild(toggle);
+  if (memNote) {
+    const note = document.createElement('span');
+    note.className = 'note ' + (memNote.bad ? 'bad' : 'ok');
+    note.textContent = memNote.text;
+    foot.appendChild(note);
+  }
+  host.appendChild(foot);
+
+  const json = document.createElement('div');
+  json.className = 'memjson';
+  json.style.display = memJsonOpen ? 'block' : 'none';
+  json.textContent = JSON.stringify(memState.pending, null, 2);
+  host.appendChild(json);
+}
+
+async function saveMemory() {
+  const r = await (await fetch('/api/memory/save', { method: 'POST' })).json();
+  memNote = r.ok ? { text: 'saved to John\'s file' }
+                 : { bad: true, text: '🚫 blocked before saving: ' + (r.reason || 'failed the guardrail') };
+  renderCustomerMemory(r);
+}
+
+async function forgetMemory() {
+  if (!confirm('Forget everything the assistant remembers about John?')) return;
+  const r = await (await fetch('/api/memory/forget', { method: 'POST' })).json();
+  memNote = { text: 'forgotten' };
+  renderCustomerMemory(r);
 }
 
 function resetIdle() {

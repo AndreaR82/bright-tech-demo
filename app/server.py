@@ -5,7 +5,9 @@ Endpoints
     POST /api/ask        {question, think_hard} → SSE stream of trace events
     POST /api/reset      end the visitor's session, compact it into booth memory
     POST /api/mode       presenter switch: eager | careful
-    GET  /api/state      cards, counters, booth memory, health
+    POST /api/memory/save    commit the pending customer profile to John's file
+    POST /api/memory/forget  wipe John's file (presenter control)
+    GET  /api/state      cards, counters, booth + customer memory, health
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import llm, pipeline, tools
+from . import llm, memory, pipeline, tools
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
@@ -165,6 +167,18 @@ def reset() -> dict[str, Any]:
     return {"ok": True, "card": card, "memory": MEMORY[:12]}
 
 
+@app.post("/api/memory/save")
+def memory_save() -> dict[str, Any]:
+    """Commit the pending profile. Only saved memory is ever read back into a prompt,
+    so this is where the guardrail sits — see app/memory.py."""
+    return memory.save()
+
+
+@app.post("/api/memory/forget")
+def memory_forget() -> dict[str, Any]:
+    return memory.forget()
+
+
 @app.post("/api/mode")
 def set_mode(body: Mode) -> dict[str, Any]:
     global MODE
@@ -216,6 +230,7 @@ def state() -> dict[str, Any]:
             },
         },
         "memory": MEMORY[:12],
+        "customer_memory": {**memory.state(), "labels": pipeline.CFG["customer_memory"]},
         "top_topic": top_topic,
         "rates_as_at": tools.RATES_AS_AT,
     }

@@ -19,7 +19,7 @@ from typing import Any, Iterator
 
 import yaml
 
-from . import llm, tools
+from . import llm, memory, tools
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.yaml"
 
@@ -259,9 +259,11 @@ def _render_facts(facts: list[dict[str, Any]]) -> str:
 
 
 def _with_context(question: str, session: Session, data: bool = False) -> str:
-    """The question, preceded by the conversation so far (and, for the specialists,
-    the tool results behind it)."""
+    """The question, preceded by what we remember about the customer and the
+    conversation so far (and, for the specialists, the tool results behind it)."""
     parts = []
+    if profile := memory.for_prompt():
+        parts.append(f"What you remember about {CFG['customer_name']} from earlier visits:\n{profile}")
     if session.turns:
         parts.append("Conversation so far:\n" + session.conversation())
         if data and (earlier := session.earlier_data()):
@@ -477,6 +479,11 @@ def _draft(
     asked = f"Question: {question}"
     if standalone and standalone != question:
         asked += f"\n(He means: {standalone})"
+    # Background, never a source: numbers still come only from the document, which is
+    # also what the fact checker holds the draft against.
+    if profile := memory.for_prompt():
+        asked += (f"\n\nWhat you remember about him from earlier visits (background only —"
+                  f" never quote a number from here):\n{profile}")
     messages.append({"role": "user", "content": f"{asked}\n\nData you may use:\n{document}{extra}"})
     pieces: list[str] = []
     stats: dict[str, Any] = {}
@@ -533,6 +540,13 @@ def run_turn(
     customer = CFG["customer_name"].split()[0]
     yield {"type": "turn_start", "turn": session.turn, "question": question, "mode": mode,
            "precision": backend.precision}
+
+    # 0. Customer memory, read back. No model call — it is a file read — but it goes on
+    # the trace because it changes what every stage below sees.
+    if profile := memory.for_prompt():
+        yield _step("Customer memory", None, kind="tool")
+        yield _done(0.0, f"🧠 loaded {len(profile.splitlines())} thing(s) we remember",
+                    "neutral", {"remembered": profile})
 
     # 1 + 2. Input check and routing run in parallel: the check is never skipped,
     # and the router's answer is simply thrown away if the question is blocked.
@@ -708,5 +722,18 @@ def run_turn(
     seconds = time.monotonic() - turn_started
     COUNTERS.seconds += seconds
     yield {"type": "message", "role": "assistant", "text": draft, "warning": warning}
+
+    # 7. Customer memory, written. After the answer is already on screen, so the extra
+    # call never delays the reply. It updates the pending profile only — nothing is
+    # read back until someone presses Save and the guardrail passes it.
+    yield _step("Customer memory", backend)
+    before = memory.state()["pending"]
+    profile, mem_seconds, mem_tokens = memory.update(session, _prompt("customer_memory"), backend)
+    _record(backend, mem_tokens, mem_seconds)
+    learned = [f for f in memory.FIELDS if profile[f] != before[f]]
+    yield _done(mem_seconds,
+                f"🧠 {', '.join(learned)} updated" if learned else "🧠 nothing new to remember",
+                "neutral", {"pending": profile, "not yet saved": memory.changed()})
+    yield {"type": "customer_memory", **memory.state()}
 
     yield {"type": "turn_end", "seconds": round(seconds, 2)}

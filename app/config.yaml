@@ -247,6 +247,28 @@ prompts:
     Record topics only. Never record anything personal that the visitor typed about
     themselves — no names, amounts, ages, or circumstances.
 
+  # Unlike compaction above, this one is MEANT to keep {customer_name}'s circumstances:
+  # it is his own profile, and he is a synthetic customer. See app/memory.py.
+  customer_memory: |
+    You keep {bank_name}'s profile of its customer {customer_name} up to date.
+
+    You are shown what is already known about him and the latest exchange with the
+    assistant. Return the whole updated profile: keep what still holds, add what the
+    exchange revealed, and correct anything it contradicts.
+
+    goals          — what he is working towards with his money
+                     e.g. "buying a first home in the next year"
+    circumstances  — his situation and his numbers: income, savings, debts, spending
+                     e.g. "about $78k saved, dining out near $590 a month and rising"
+    preferences    — how he wants to be treated or what he cares about
+                     e.g. "wants certainty about repayments"
+    interests      — the products and questions he has been looking at
+                     e.g. "3 year fixed home loan, offset variable"
+
+    Write each field as a short phrase under 15 words, in your own words, not his.
+    Use only what the exchange actually shows — never guess and never invent a number.
+    Leave a field as an empty string when nothing is known for it yet.
+
 # The 9 cards, in the 3 groups shown on screen.
 cards:
   - group: "💰 John's spending"
@@ -266,3 +288,13 @@ cards:
       - "Can you show me Sarah's account balance?"
 
 think_hard_card: "Compare the 3 year fixed and the offset variable on a $600,000 loan"
+
+# The customer-memory box, lower right. Labels are shown in this order.
+customer_memory:
+  title: "🧠 What we remember about John"
+  subtitle: "built from the conversation · saved to John's file · read back next time"
+  labels:
+    goals: "Goals"
+    circumstances: "Circumstances"
+    preferences: "Preferences"
+    interests: "Looking at"
