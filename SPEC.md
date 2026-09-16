@@ -35,10 +35,12 @@ readable by both.
 ```
 
 - Trace rows are **persistent**: `Step | Model | Time | Outcome`, coloured
-  badges (green pass / red blocked / amber warning / grey non-AI).
+  badges (green pass / red blocked / amber warning / blue for neutral and
+  non-AI steps).
 - The `Model` column carries the LoRA story (`Gemma 4B`, `Gemma 4B + judge-LoRA`,
   `—` for non-AI steps like SQL and the calculator).
-- Current turn expanded at top; older turns collapse to one line. Min 16px type.
+- Current turn expanded at top; older turns collapse to one line. Chat bubbles
+  and the input are 16px; the trace table runs 12.5–14px.
 - **No simple/engineer toggle.** One view for everyone.
 
 ## Pipeline (hybrid: fixed safety envelope, agentic specialists)
@@ -50,7 +52,7 @@ question
   → specialist            (AGENTIC, max 4 tool calls)
         📊 Spending Analyst  → SQL over John's transactions (customer-scoped)
         🏠 Product Advisor   → product search + loan calculator
-  → ✍️ Draft answer       (code, always)      base Gemma, 60–80 words
+  → ✍️ Draft answer       (code, always)      base Gemma, under 80 words
   → 🛡️ Advice check ∥ ✅ Fact check           (parallel)
   → (≤1 rewrite, then drop unsupported sentences)
   → release to chat
@@ -65,14 +67,14 @@ calculator; the fact checker verifies claims against those tool results.
 
 | Guardrail | Model | Labels / behaviour |
 |---|---|---|
-| Input check | base Gemma | safe / off-topic / other-customer / offensive → block politely |
-| Advice check | base Gemma + written definitions today; **advice-LoRA** once trained (`train/`) | `factual information` → pass · `personalised recommendation` → 🚫 block → rewrite. Binary since a labelling audit found the old middle class split on verb choice, not on anything learnable; the general-advice warning is now a deterministic rule — every `product_advisor` answer carries one |
-| Fact check | base Gemma + **judge-LoRA** (already trained, bacc 0.82 vs 0.72 zero-shot) | sentence-level, only sentences containing numbers/rates/product names; fail → 1 rewrite → else drop the sentence |
+| Input check | base Gemma | safe / off_topic / other_customer / offensive / injection → block politely |
+| Advice check | base Gemma + written definitions today; the **advice-LoRA** is trained (`train/`, see `reports/advice_learning_curve.md`) but not yet served | `factual information` → pass · `personalised recommendation` → 🚫 block → rewrite. Binary since a labelling audit found the old middle class split on verb choice, not on anything learnable; the general-advice warning is now a deterministic rule — every `product_advisor` answer carries one |
+| Fact check | base Gemma today; the **judge-LoRA** is trained (bacc 0.82 vs 0.72 zero-shot) but not yet served | sentence-level, only sentences carrying a digit, `%`, `$` or "per cent", and at most four per draft; fail → 1 rewrite → else drop the sentence |
 
 - **Eager vs Careful writer prompt**: presenter switch. Guardrails stay on in
   both. Default **Eager** (compliance lives in the guardrail layer, not the
-  prompt — stated on screen, not hidden). Counter: "advice drafts caught today:
-  Eager N / Careful M".
+  prompt — stated on screen, not hidden). `/api/state` counts eager and careful
+  blocks separately; the bottom strip shows the total.
 - Nothing reaches the chat before the checks pass. The **draft streams into the
   trace panel**; blocked drafts show struck through in red.
 
@@ -80,8 +82,10 @@ calculator; the fact checker verifies claims against those tool results.
 
 - **John Citizen**, 32, Parramatta, IT project manager, $105k, saving for a
   first home. Everyday + savings (~$78k) + credit card (−$3.2k) + car loan.
-- 18 months, ~1,500 synthetic transactions. Discoverable quirks: Sunday-night
-  food delivery spikes, an unused gym membership, one concert+hotel splurge.
+- 18 months, 1,500 synthetic transactions. Discoverable quirks: Sunday-night
+  food delivery spikes (worse in "deadline weeks"), a fortnightly gym
+  membership, one concert+hotel splurge, dining and delivery drifting up ~25%
+  over the last six months.
 - **Fictional bank and fictional products** (~14: home loans, savings, cards),
   realistic market-like rates. No real bank data, no scraping, no approvals.
 - Products: structured table (rates, fees, LVR, offset) for the calculator and
@@ -95,17 +99,26 @@ calculator; the fact checker verifies claims against those tool results.
 food delivery halved
 🏠 first home: 3-year fixed rate (factual) · how much could I borrow
 🛡️ guardrails: fix or variable? (blocked) · which loan should I pick? (blocked) ·
-Sarah's balance (blocked at input)
-🧠 Think hard: one card runs real Gemma thinking (~30s) with a live timer.
+find me a credit card to cover my expenses · Sarah's balance (blocked at input)
+🧠 Think hard: a ninth card that runs the writer with Gemma's thinking mode on
+(~40s on the booth card, live timer on the row). The scratchpad streams into the
+trace panel as its own step and is never part of the draft — the guardrails check
+the answer exactly as they do on every other card.
 
 ## Memory
 
-- **Session memory**: specialists + writer see the conversation; guardrails judge
-  the current turn only. Reset by "New visitor" or 90s idle.
-- **Booth memory**: at reset, one compaction call → `{topics, guardrail
-  outcomes, 1-line summary}` shown in the bottom strip ticker. Redacted, checked
-  before display, **never fed back into the chat** (prompt-injection path).
-  Deleted at the end of the event.
+- **Session memory**: the router rewrites each follow-up into a standalone question
+  ("and the 5 year one?" → "what's the rate on the 5 year fixed loan?"), shown in
+  the trace as "understood as". Specialists get the conversation plus the last two
+  turns' tool results; the writer and the fact check get those results too, so an
+  earlier number stays grounded. The input check screens the raw question (with the
+  previous one as context); the advice check judges the draft alone. Questions
+  blocked at the door never enter session memory. Reset by the "New visitor" button; idle auto-reset is off unless
+  `limits.idle_reset_seconds` is set above 0.
+- **Booth memory**: at reset, one compaction call → `{1-line summary, up to 4
+  topics}` shown in the bottom strip ticker; the guardrail counters live beside
+  it, outside the card. Redacted, checked before display, **never fed back into
+  the chat** (prompt-injection path). Deleted at the end of the event.
 
 ## Non-goals / deliberate exclusions
 
@@ -116,14 +129,15 @@ Sarah's balance (blocked at input)
 ## Runtime
 
 Python + FastAPI + SSE, vanilla HTML/JS (no build step), SQLite, `uv`.
-vLLM serves Gemma 4 E4B + judge LoRA; demo talks OpenAI-compatible API.
-systemd `Restart=always`; preflight script; labelled "RECORDING — not live"
-fallback replay if vLLM dies mid-event.
+vLLM serves Gemma 4 E4B — one base model today, the two LoRAs alongside it
+once `--enable-lora` goes on; demo talks the OpenAI-compatible API.
+systemd `Restart=always`; preflight script. A labelled "RECORDING — not live"
+fallback replay for a mid-event vLLM death is still to be built.
 
 ## Two-day plan
 
 **Day 1** — vLLM verified with LoRA → skeleton + live trace → John's data →
-specialists + tools → three guardrails → 8 cards → end-to-end demo.
+specialists + tools → three guardrails → 9 cards → end-to-end demo.
 **Day 2 am** — booth memory, counters, reset, preflight, recording fallback,
 speed pass. **Day 2 pm** — you test with 2–3 colleagues, I fix what they find.
 Stretch, in order: EmbeddingGemma, FP8/speculative decoding.
@@ -135,7 +149,8 @@ Distillation: Claude labels, Gemma learns, the box serves it offline.
 ```
 gen_drafts.py       real specialists + real writer (eager AND careful) → data/drafts.jsonl
 label_drafts.py     Claude Opus 5, Batch API, Andrea's definitions     → data/labelled.jsonl
-build_train_data.py stratified split, runtime-identical prompt format  → data/processed/advice_{train,val,test}.jsonl
+                    (or Claude Code subagents + merge_agent_labels.py)
+build_train_data.py question-grouped split, runtime-identical prompt format → data/processed/advice_{train,val,test}.jsonl
 train/run.sh        QLoRA in the NGC container (reuses gj-train image) → outputs/gemma4-e4b-advice
 eval_advice.py      base vs LoRA on held-out test                      → ship it or don't
 ```

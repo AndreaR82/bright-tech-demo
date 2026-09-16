@@ -27,16 +27,22 @@ uv run python scripts/preflight.py
 ```
 
 Runs every question card through the real pipeline, checks the guardrails
-actually fire, prints the timings, exits non-zero if anything is off.
+actually fire, then runs two short follow-up conversations (a number carried
+across turns, guardrails on "should I take it?"), prints the timings, exits
+non-zero if anything is off.
+
+For the full multi-turn check — eight conversations of follow-ups like "and the 5
+year one?" — run `uv run python scripts/eval_multiturn.py`.
 
 ## At the booth
 
 | Control | What it does |
 |---|---|
 | **New visitor** button | compacts the session into booth memory, clears both panels |
-| 90 s idle | does the same automatically |
+| Idle auto-clear | off by default (`limits.idle_reset_seconds: 0`); set it to a number of seconds to re-enable |
 | **Ctrl+M** | flips the writer prompt: eager ↔ careful (guardrails stay on either way) |
-| `app/config.yaml` | prompts, cards, limits — edit and press New visitor, no restart |
+| 🧠 **Think hard** card | writer runs with Gemma's thinking mode on (~40 s); the scratchpad shows in the trace, never in the chat |
+| `app/config.yaml` | prompts, cards, limits — edit, then restart the server (it is read once at import) |
 
 ## Layout
 
@@ -48,19 +54,29 @@ app/
   pipeline.py   the agent: input check → route → specialist → draft → checks
   server.py     FastAPI + SSE + booth memory
 static/index.html   the booth page (no build step)
-scripts/        generate_data.py, preflight.py
-data/           bank.db (generated), products.json (fictional catalogue)
+scripts/        generate_data.py, preflight.py, eval_multiturn.py, and the
+                fine-tuning pipeline (gen_drafts → label → build → eval)
+data/           bank.db (generated), products.json (hand-written catalogue)
+                — all of data/ is gitignored, so a fresh clone needs
+                products.json put back before the server will import
 ```
 
 ## Still to do
 
-- the advice definitions in `app/config.yaml` are written up from ASIC's
-  guidance and verified against primary sources (12 Sep 2026), with the reasoning
-  and currency notes in [app/fin-adv-defin.md](app/fin-adv-defin.md) — read them
-  before labelling, since that wording is what the adapter learns. Approved by
-  Andrea on 14 Sep 2026 — see the sign-off at the top of that file
-- serve the already-trained groundedness judge adapter (`--enable-lora` +
-  `VLLM_JUDGE_MODEL`); today the fact check runs on the base model
+- serve the two adapters — the groundedness judge (trained in the
+  `gemma4-groundedness-judge` repo) and the advice detector trained here:
+  `--enable-lora` plus `VLLM_JUDGE_MODEL` / `VLLM_ADVICE_MODEL`. Today both
+  checks run on the base model
+- run the ship gate on the advice adapter (`eval_advice.py --adapter advice`);
+  so far only the base model has been scored — `reports/base_vllm_eval.txt`
+- recording fallback for the "vLLM died mid-event" case
+- EmbeddingGemma for product search; FP8 / speculative decoding for speed
+
+The advice definitions in `app/config.yaml` are written up from ASIC's guidance
+and verified against primary sources (12 Sep 2026), with the reasoning and the
+currency notes in [app/fin-adv-defin.md](app/fin-adv-defin.md) — read them before
+labelling, since that wording is what the adapter learns. Approved by Andrea on
+14 Sep 2026; the sign-off at the top of that file pins the exact prompt by hash.
 
 ## Fine-tuning the advice detector
 
@@ -103,13 +119,14 @@ uv run python scripts/run_subsets.py                               # retrain on 
 uv run --with matplotlib python scripts/learning_report.py         # -> reports/advice_learning_curve.md
 ```
 
-**Already generated** (`data/drafts.jsonl`): 1,560 rows from 547 distinct questions,
-**1,152 unique drafts** after de-duplication, ~39 words each, an even eager/careful
-split. A 50-draft sample labelled by Claude against the binary definitions came out
-**86% factual / 14% personalised recommendation** — so expect roughly 160 examples of
-the class that matters across the full set. That is the thin part, and the reason
-`eval_advice.py` reports its recall separately. Labelling all 1,152 costs about
-**$3.14** via the Batch API, or no credits at all via the subagent path.
+**Generated and labelled.** `data/drafts.jsonl` holds 1,560 rows from 547 distinct
+questions — **1,152 unique drafts** after de-duplication, ~39 words each, an even
+eager/careful split. All 1,152 are labelled (`data/labelled.jsonl`): **1,069 factual
+/ 83 personalised recommendation**. The class that matters is 7% of the set — that is
+the thin part, the reason `eval_advice.py` reports its recall separately, and the
+reason `gen_counterfactuals.py` adds 308 rewritten rows on top (1,460 in all).
+Labelling the full set costs about **$3.14** via the Batch API, or no credits at all
+via the subagent path.
 
 The same 50 drafts were labelled three times while the definitions were being fixed.
 As a binary decision the three passes agree on **49 of 50 (98%)**; under the older
@@ -126,5 +143,11 @@ Watch the loss: a healthy run starts around 1–3. Exactly 0, with `grad_norm` 0
 `mean_token_accuracy` 0, means the assistant-turn marker wasn't found and every token
 was masked — the trainer will still cheerfully save an adapter that learned nothing.
 Near 13–15 means masking broke the other way and it's training on the prompt.
-- recording fallback for the "vLLM died mid-event" case
-- EmbeddingGemma for product search; FP8 / speculative decoding for speed
+
+**Result so far** ([reports/advice_learning_curve.md](reports/advice_learning_curve.md)):
+the full run takes F1 on `personalised_recommendation` from **0.674 to 0.966** and its
+recall from **0.508 to 0.949**, scored on the same 373 val+test drafts by first-token
+logit. The first 300 labelled rows buy most of it; 900 → 1,087 moves nothing this eval
+can resolve. That report is for understanding, not for choosing — the ship-or-don't
+gate is still `eval_advice.py --adapter advice` on the untouched test split, and it
+needs the adapter served.
