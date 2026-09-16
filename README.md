@@ -20,6 +20,49 @@ Then open <http://localhost:8090>. Port 8090 because 8080 is your existing
 vLLM must be serving Gemma on port 8000 (`spark-vllm.service`). Override with
 `VLLM_BASE_URL`, `VLLM_MODEL`, `VLLM_JUDGE_MODEL`, `VLLM_ADVICE_MODEL`.
 
+To use the trained advice detector rather than the base model for the advice
+check, point the app at the served LoRA:
+
+```bash
+VLLM_ADVICE_MODEL=advice uv run uvicorn app.server:app --host 127.0.0.1 --port 8090
+```
+
+### The FP8 endpoint (the ⚡ toggle)
+
+A second vLLM server on port 8001 serves the same weights and the same adapter,
+quantized to FP8, so the booth can switch precision between questions and show
+the speed and quality difference on screen. Only the quantization flags differ —
+the A/B isolates one variable:
+
+```bash
+spark-vllm-fp8.service   # same as spark-vllm.service, plus:
+  -p 8001:8000 --name vllm_fp8
+  --gpu-memory-utilization 0.22
+  --quantization fp8
+  --kv-cache-dtype fp8
+```
+
+Override with `VLLM_FP8_BASE_URL`, `VLLM_FP8_MODEL`, `VLLM_FP8_ADVICE_MODEL`,
+`VLLM_FP8_JUDGE_MODEL`. `VLLM_PRECISION` sets which endpoint is the default for
+anything that does not ask for one (bf16 unless you say otherwise).
+
+The FP8 server is optional. With it down the ⚡ pill greys out, every turn runs
+in bf16, and preflight still goes green.
+
+**Measured** ([reports/fp8_vs_bf16.md](reports/fp8_vs_bf16.md)): bf16 19.1 →
+FP8 35.6 tok/s at batch size 1 (**1.86x**), 33.2 with the advice adapter loaded.
+Weights 11.19 GiB against 15.26. Quantizable linears are only 49% of this
+checkpoint — the per-layer embedding tables are another 36% and stay bf16 — so
+~1.8x is the ceiling, not 2x. On the 224-row test split the adapter scores
+**identically** at both precisions (0.973 recall on `personalised_recommendation`,
+every counterfactual slice unchanged); the base model loses a little (0.757 →
+0.730), so the fine-tune bought robustness to quantization as well as accuracy.
+
+**Warm it up before the doors open.** The first few FP8 requests run at roughly
+bf16 speed while Cutlass and Triton autotune; after ~5 calls it settles. Its
+torch.compile cache key differs from the bf16 server's, so a cold start compiles
+from scratch rather than loading the AOT cache.
+
 ## Before the doors open
 
 ```bash
@@ -41,6 +84,7 @@ year one?" — run `uv run python scripts/eval_multiturn.py`.
 | **New visitor** button | compacts the session into booth memory, clears both panels |
 | Idle auto-clear | off by default (`limits.idle_reset_seconds: 0`); set it to a number of seconds to re-enable |
 | **Ctrl+M** | flips the writer prompt: eager ↔ careful (guardrails stay on either way) |
+| ⚡ **FP8** toggle | sends the next question to the FP8 endpoint on :8001 instead of bf16 on :8000. Per-question, so a click never splits a turn. Greyed out when :8001 is down. The footer keeps a running `bf16 … · fp8 …` tok/s comparison that survives **New visitor** |
 | 🧠 **Think hard** card | writer runs with Gemma's thinking mode on (~40 s); the scratchpad shows in the trace, never in the chat |
 | `app/config.yaml` | prompts, cards, limits — edit, then restart the server (it is read once at import) |
 
@@ -63,14 +107,13 @@ data/           bank.db (generated), products.json (hand-written catalogue)
 
 ## Still to do
 
-- serve the two adapters — the groundedness judge (trained in the
-  `gemma4-groundedness-judge` repo) and the advice detector trained here:
-  `--enable-lora` plus `VLLM_JUDGE_MODEL` / `VLLM_ADVICE_MODEL`. Today both
-  checks run on the base model
-- run the ship gate on the advice adapter (`eval_advice.py --adapter advice`);
-  so far only the base model has been scored — `reports/base_vllm_eval.txt`
+- serve the groundedness judge (trained in the `gemma4-groundedness-judge` repo)
+  and point `VLLM_JUDGE_MODEL` at it. The fact check still runs on the base
+  model; the advice detector is served and wired up (`VLLM_ADVICE_MODEL=advice`)
 - recording fallback for the "vLLM died mid-event" case
-- EmbeddingGemma for product search; FP8 / speculative decoding for speed
+- EmbeddingGemma for product search; speculative decoding for speed
+- `--max-loras` is still 1 on both servers. Not a problem today — one adapter is
+  served — but the judge adapter will need it raised
 
 The advice definitions in `app/config.yaml` are written up from ASIC's guidance
 and verified against primary sources (12 Sep 2026), with the reasoning and the

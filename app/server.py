@@ -63,6 +63,10 @@ class Ask(BaseModel):
     # The Think hard card: the writer runs with Gemma's thinking mode on. Only the
     # writer — every check keeps its JSON-constrained decoding.
     think_hard: bool = False
+    # Which vLLM endpoint answers this turn: "bf16" or "fp8". Per-request rather
+    # than a server global, so a click mid-turn can never split one turn across two
+    # backends. Anything unknown resolves to bf16 (llm.resolve).
+    precision: str = "bf16"
 
 
 class Mode(BaseModel):
@@ -87,7 +91,20 @@ def ask(body: Ask) -> StreamingResponse:
             yield sse({"type": "turn_end", "seconds": 0})
             return
         try:
-            for event in pipeline.run_turn(question, SESSION, mode=MODE, think_hard=body.think_hard):
+            # A pill left on FP8 while that server is down would strand the booth,
+            # so fall back rather than fail — and say so on the trace.
+            # An unknown name resolves to bf16 anyway (llm.resolve), so only warn
+            # about a backend that really exists and really is not answering.
+            precision = body.precision if body.precision in llm.BACKENDS else "bf16"
+            if precision != "bf16" and not llm.availability()[precision]["ok"]:
+                yield sse({"type": "step_start", "step": "Precision", "model": "—", "kind": "tool",
+                           "at": time.time()})
+                yield sse({"type": "step_end", "seconds": 0, "badge": "warn",
+                           "outcome": f"⚠️ {precision} endpoint is down — answering in bf16",
+                           "detail": {"base_url": llm.BACKENDS[precision].base_url}})
+                precision = "bf16"
+            for event in pipeline.run_turn(question, SESSION, mode=MODE,
+                                           think_hard=body.think_hard, precision=precision):
                 yield sse(event)
         except Exception as exc:  # never leave a visitor looking at a frozen screen
             yield sse({"type": "message", "role": "assistant",
@@ -111,6 +128,9 @@ def compact_session(session: pipeline.Session) -> dict[str, Any] | None:
         [{"role": "system", "content": pipeline.CFG["prompts"]["compaction"]},
          {"role": "user", "content": transcript}],
         schema=COMPACTION_SCHEMA, max_tokens=160,
+        # Pinned to bf16: booth memory goes on a public screen and must be
+        # reproducible, and must still be written when the FP8 box is down.
+        backend=llm.resolve("bf16"),
     )
     data = c.data or {"summary": "A conversation about banking.", "topics": []}
     card = {
@@ -126,6 +146,7 @@ def compact_session(session: pipeline.Session) -> dict[str, Any] | None:
     check = llm.complete(
         [{"role": "system", "content": pipeline._prompt("input_check")},
          {"role": "user", "content": card["summary"]}],
+        backend=llm.resolve("bf16"),
         schema=pipeline.INPUT_SCHEMA, max_tokens=90,
     )
     if (check.data or {}).get("label") in ("offensive", "injection"):
@@ -178,6 +199,21 @@ def state() -> dict[str, Any]:
             "fact_failures": counters.fact_failures,
             "input_blocks": counters.input_blocks,
             "tokens_per_second": round(counters.tokens_per_second, 1),
+        },
+        "precision": {
+            "available": llm.availability(),
+            # Per-backend decode throughput, accumulated all day: this is the
+            # bf16-vs-FP8 comparison the footer shows. Never reset by New visitor.
+            "stats": {
+                name: {
+                    "tok_s": round(c.gen_tokens_per_second, 1),
+                    "tokens": c.tokens,
+                    "calls": c.calls,
+                    "turns": c.turns,
+                    "advice_blocked": c.advice_blocked_eager + c.advice_blocked_careful,
+                }
+                for name, c in pipeline.PERF.items()
+            },
         },
         "memory": MEMORY[:12],
         "top_topic": top_topic,

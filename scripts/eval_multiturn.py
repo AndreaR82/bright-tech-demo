@@ -79,14 +79,14 @@ ROUTE_LABELS = {"Spending Analyst": "spending", "Product Advisor": "product", "S
 FAILED_ANSWER = re.compile(r"couldn't verify those numbers|Something broke|\[model error", re.I)
 
 
-def run_one(question: str, session: pipeline.Session) -> dict[str, Any]:
+def run_one(question: str, session: pipeline.Session, precision: str = "bf16") -> dict[str, Any]:
     """Run a turn and boil its events down to what the checks need."""
     rec: dict[str, Any] = {"q": question, "route": None, "standalone": None, "sql": [], "calcs": [],
                            "input_block": False, "advice_block": False, "ungrounded": 0,
                            "removed": 0, "answer": "", "seconds": 0.0}
     step = ""
     started = time.monotonic()
-    for ev in pipeline.run_turn(question, session):
+    for ev in pipeline.run_turn(question, session, precision=precision):
         t = ev["type"]
         if t == "step_start":
             step = ev["step"]

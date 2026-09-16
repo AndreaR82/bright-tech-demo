@@ -5,10 +5,16 @@ produced the stages it should, then prints the timings. One command, one
 green-or-red answer.
 
     uv run python scripts/preflight.py
+
+Add --precision fp8 to run the same sweep against the quantized endpoint — the
+guardrail assertions below are the regression test for what quantization changed.
+
+    uv run python scripts/preflight.py --precision fp8
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -26,10 +32,22 @@ EXPECTED_BLOCK = {
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--precision", default="bf16", choices=sorted(llm.BACKENDS),
+                    help="which vLLM endpoint to run the sweep against (default bf16)")
+    args = ap.parse_args()
     failures: list[str] = []
 
-    health = llm.health()
+    health = llm.health(llm.resolve(args.precision))
     print(f"vLLM        : {'OK' if health['ok'] else 'DOWN'}  {', '.join(health['models']) or health.get('error', '')}")
+    # A missing FP8 box is a warning, never a failure: the booth has to go green
+    # with one server up. Only the endpoint actually being swept is fatal.
+    for name, probe in health["backends"].items():
+        mark = "OK  " if probe["ok"] else "DOWN"
+        note = "  ← sweeping this one" if name == args.precision else ""
+        print(f"  {name:<9} : {mark} {probe['base_url']}{note}")
+        if not probe["ok"] and name != args.precision:
+            print(f"             (the {name} toggle will be greyed out at the booth)")
     if not health["ok"]:
         return 1
 
@@ -48,7 +66,7 @@ def main() -> int:
         session = pipeline.Session()
         started = time.monotonic()
         steps, answer, blocked_by, last_step, seconds = 0, "", None, "", 0.0
-        for event in pipeline.run_turn(question, session):
+        for event in pipeline.run_turn(question, session, precision=args.precision):
             if event["type"] == "step_start":
                 steps += 1
                 last_step = event["step"]
@@ -78,7 +96,7 @@ def main() -> int:
         print(f"\nfollow-up chain: {name}")
         session, prev = pipeline.Session(), None
         for spec in eval_multiturn.CHAINS[name]:
-            rec = eval_multiturn.run_one(spec["q"], session)
+            rec = eval_multiturn.run_one(spec["q"], session, precision=args.precision)
             fails = eval_multiturn.check(spec, rec, prev)
             print(f"  {'✓' if not fails else '✗'} {spec['q']:<66} {rec['seconds']:>5.1f}s")
             failures += [f"{name}: {spec['q']} — {f}" for f in fails]
@@ -86,6 +104,10 @@ def main() -> int:
 
     counters = pipeline.COUNTERS
     print(f"\n{counters.turns} turns · {counters.tokens} tokens · {counters.tokens_per_second:.1f} tok/s")
+    for name, c in pipeline.PERF.items():
+        if c.calls:
+            print(f"  {name:<9} {c.calls:>3} calls · {c.tokens:>6} tokens · "
+                  f"{c.gen_tokens_per_second:5.1f} tok/s decode")
 
     if failures:
         print("\nFAILED:")

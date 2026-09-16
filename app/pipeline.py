@@ -167,13 +167,39 @@ class Counters:
     input_blocks: int = 0
     tokens: int = 0
     seconds: float = 0.0
+    calls: int = 0
+    gen_seconds: float = 0.0  # summed per-call latency, not wall clock
 
     @property
     def tokens_per_second(self) -> float:
         return self.tokens / self.seconds if self.seconds else 0.0
 
+    @property
+    def gen_tokens_per_second(self) -> float:
+        """Decode throughput, for comparing one backend against another.
+
+        `tokens_per_second` divides by whole-turn wall clock, which includes SQL,
+        product search, the calculator and idle time — mostly noise in a bf16/FP8
+        comparison. Summing per-call latency instead also survives the stages that
+        run in parallel: four concurrent judges contribute four latencies and four
+        token counts, so the ratio stays honest.
+        """
+        return self.tokens / self.gen_seconds if self.gen_seconds else 0.0
+
 
 COUNTERS = Counters()
+
+# The same counters again, split by backend, so the booth can show bf16 and FP8
+# side by side. Never reset by "New visitor" — the comparison builds up all day.
+PERF: dict[str, Counters] = {name: Counters() for name in llm.BACKENDS}
+
+
+def _record(backend: llm.Backend, completion_tokens: int, seconds: float) -> None:
+    COUNTERS.tokens += completion_tokens
+    p = PERF[backend.precision]
+    p.tokens += completion_tokens
+    p.gen_seconds += seconds
+    p.calls += 1
 
 
 # ------------------------------------------------------------------- helpers ---
@@ -258,11 +284,16 @@ def _document(facts: list[dict[str, Any]], session: Session) -> str:
 # -------------------------------------------------------------------- stages ---
 
 
-def _step(step: str, model: str | None, kind: str = "ai") -> dict[str, Any]:
+def _step(
+    step: str, backend: llm.Backend | None, kind: str = "ai", role: str = "base"
+) -> dict[str, Any]:
+    """One trace row. `role` picks which of the backend's models did the work, so
+    the Model column says both the precision and whether an adapter was used."""
+    model = backend.model_for(role) if backend else None
     return {
         "type": "step_start",
         "step": step,
-        "model": llm.label_for(model) if model else "—",
+        "model": llm.label_for(model, backend) if model else "—",
         "kind": kind,
         "at": time.time(),
     }
@@ -278,7 +309,7 @@ def _done(seconds: float, outcome: str, badge: str = "pass", detail: Any = None)
     }
 
 
-def _spending_agent(question: str, session: Session) -> Iterator[dict[str, Any]]:
+def _spending_agent(question: str, session: Session, backend: llm.Backend) -> Iterator[dict[str, Any]]:
     """Agentic: the model writes SQL, reads the result, decides whether to go again."""
     facts: list[dict[str, Any]] = []
     messages = [
@@ -287,11 +318,11 @@ def _spending_agent(question: str, session: Session) -> Iterator[dict[str, Any]]
     ]
 
     for _ in range(CFG["limits"]["max_tool_calls"]):
-        yield _step("Spending Analyst", llm.BASE_MODEL)
+        yield _step("Spending Analyst", backend)
         # Generous cap: constrained JSON that truncates mid-string is unparseable,
         # and a 4B model occasionally pads. Unused tokens cost nothing.
-        c = llm.complete(messages, schema=SQL_ACTION_SCHEMA, compact=True, max_tokens=600)
-        COUNTERS.tokens += c.completion_tokens
+        c = llm.complete(messages, backend=backend, schema=SQL_ACTION_SCHEMA, compact=True, max_tokens=600)
+        _record(backend, c.completion_tokens, c.seconds)
         if c.error or not c.data:
             # Same as the product agent: once a query has returned rows, keep them.
             if facts:
@@ -321,7 +352,7 @@ def _spending_agent(question: str, session: Session) -> Iterator[dict[str, Any]]
     yield {"type": "facts", "facts": facts}
 
 
-def _product_agent(question: str, session: Session) -> Iterator[dict[str, Any]]:
+def _product_agent(question: str, session: Session, backend: llm.Backend) -> Iterator[dict[str, Any]]:
     facts: list[dict[str, Any]] = []
     messages = [
         {"role": "system", "content": _prompt("product_advisor")},
@@ -329,9 +360,9 @@ def _product_agent(question: str, session: Session) -> Iterator[dict[str, Any]]:
     ]
 
     for _ in range(CFG["limits"]["max_tool_calls"]):
-        yield _step("Product Advisor", llm.BASE_MODEL)
-        c = llm.complete(messages, schema=PRODUCT_ACTION_SCHEMA, compact=True, max_tokens=400)
-        COUNTERS.tokens += c.completion_tokens
+        yield _step("Product Advisor", backend)
+        c = llm.complete(messages, backend=backend, schema=PRODUCT_ACTION_SCHEMA, compact=True, max_tokens=400)
+        _record(backend, c.completion_tokens, c.seconds)
         if c.error or not c.data:
             # After a tool has answered, a garbled step can only have been "finish" or
             # one call too many — what's gathered stands, so don't flag it as a failure.
@@ -386,17 +417,17 @@ def _product_agent(question: str, session: Session) -> Iterator[dict[str, Any]]:
     yield {"type": "facts", "facts": facts}
 
 
-def _advice_check(draft: str) -> tuple[dict[str, Any], float]:
+def _advice_check(draft: str, backend: llm.Backend) -> tuple[dict[str, Any], float]:
     c = llm.complete(
         [{"role": "system", "content": _prompt("advice_check")},
          {"role": "user", "content": f"Draft reply:\n{draft}"}],
-        model=llm.ADVICE_MODEL, schema=ADVICE_SCHEMA, max_tokens=160,
+        backend=backend, model=backend.advice_model, schema=ADVICE_SCHEMA, max_tokens=160,
     )
-    COUNTERS.tokens += c.completion_tokens
+    _record(backend, c.completion_tokens, c.seconds)
     return (c.data or {"label": "factual_information", "sentence": "", "reason": "check unavailable"}), c.seconds
 
 
-def _fact_check(draft: str, document: str) -> tuple[list[dict[str, Any]], float]:
+def _fact_check(draft: str, document: str, backend: llm.Backend) -> tuple[list[dict[str, Any]], float]:
     """Sentence-level, only sentences that actually state a checkable fact."""
     started = time.monotonic()
     claims = [s for s in _sentences(draft) if _CHECKABLE_RE.search(s)]
@@ -407,9 +438,9 @@ def _fact_check(draft: str, document: str) -> tuple[list[dict[str, Any]], float]
         c = llm.complete(
             [{"role": "system", "content": JUDGE_SYSTEM},
              {"role": "user", "content": f"Document:\n{document.strip()}\n\nClaim:\n{claim.strip()}"}],
-            model=llm.JUDGE_MODEL, max_tokens=150,
+            backend=backend, model=backend.judge_model, max_tokens=150,
         )
-        COUNTERS.tokens += c.completion_tokens
+        _record(backend, c.completion_tokens, c.seconds)
         m = _VERDICT_RE.search(c.text or "")
         grounded = True if not m else m.group(1).lower() in ("grounded", "supported")
         return {"claim": claim, "grounded": grounded}
@@ -424,6 +455,7 @@ def _draft(
     document: str,
     session: Session,
     mode: str,
+    backend: llm.Backend,
     extra: str = "",
     temperature: float = 0.0,
     standalone: str | None = None,
@@ -447,14 +479,15 @@ def _draft(
         asked += f"\n(He means: {standalone})"
     messages.append({"role": "user", "content": f"{asked}\n\nData you may use:\n{document}{extra}"})
     pieces: list[str] = []
+    stats: dict[str, Any] = {}
     if not thinking:
-        for piece in llm.stream(messages, max_tokens=200, temperature=temperature):
+        for piece in llm.stream(messages, backend=backend, max_tokens=200, temperature=temperature, stats=stats):
             pieces.append(piece)
             yield {"type": "draft_token", "text": piece}
     else:
         thought: list[str] = []
         answered = False
-        for channel, piece in llm.stream_parts(messages, temperature=temperature):
+        for channel, piece in llm.stream_parts(messages, backend=backend, temperature=temperature, stats=stats):
             if channel == "think":
                 thought.append(piece)
                 yield {"type": "think_token", "text": piece}
@@ -471,6 +504,7 @@ def _draft(
             fallback = "".join(thought)
             pieces.append(fallback)
             yield {"type": "draft_token", "text": fallback}
+    _record(backend, stats.get("completion_tokens", 0), stats.get("seconds", 0.0))
     # Gemma sometimes escapes dollar signs as if writing LaTeX; the chat shows raw text.
     yield {"type": "draft_text", "text": "".join(pieces).strip().replace("\\$", "$")}
 
@@ -479,15 +513,26 @@ def _draft(
 
 
 def run_turn(
-    question: str, session: Session, mode: str | None = None, think_hard: bool = False
+    question: str,
+    session: Session,
+    mode: str | None = None,
+    think_hard: bool = False,
+    precision: str | None = None,
 ) -> Iterator[dict[str, Any]]:
     mode = mode or CFG.get("writer_mode", "eager")
+    # Resolved once, here, and passed down. The stages below run in thread pools,
+    # and worker threads do not inherit a ContextVar from whoever submitted them —
+    # a module-level "current backend" would leave half the turn on the other
+    # endpoint while the trace claimed otherwise. One object, threaded explicitly.
+    backend = llm.resolve(precision)
     turn_started = time.monotonic()
     session.turn += 1
     session.last_activity = time.time()
     COUNTERS.turns += 1
+    PERF[backend.precision].turns += 1
     customer = CFG["customer_name"].split()[0]
-    yield {"type": "turn_start", "turn": session.turn, "question": question, "mode": mode}
+    yield {"type": "turn_start", "turn": session.turn, "question": question, "mode": mode,
+           "precision": backend.precision}
 
     # 1 + 2. Input check and routing run in parallel: the check is never skipped,
     # and the router's answer is simply thrown away if the question is blocked.
@@ -500,21 +545,22 @@ def run_turn(
     check_future = pool.submit(
         llm.complete,
         [{"role": "system", "content": _prompt("input_check")}, {"role": "user", "content": screened}],
-        schema=INPUT_SCHEMA, max_tokens=110,
+        backend=backend, schema=INPUT_SCHEMA, max_tokens=110,
     )
     route_future = pool.submit(
         llm.complete,
         [{"role": "system", "content": _prompt("router")},
          {"role": "user", "content": _with_context(question, session)}],
-        schema=ROUTE_SCHEMA, compact=True, max_tokens=260,
+        backend=backend, schema=ROUTE_SCHEMA, compact=True, max_tokens=260,
     )
 
-    yield _step("Input check", llm.BASE_MODEL)
+    yield _step("Input check", backend)
     c = check_future.result()
-    COUNTERS.tokens += c.completion_tokens
+    _record(backend, c.completion_tokens, c.seconds)
     verdict = (c.data or {}).get("label", "safe")
     if verdict != "safe":
         COUNTERS.input_blocks += 1
+        PERF[backend.precision].input_blocks += 1
         yield _done(c.seconds, f"🚫 {verdict.replace('_', ' ')}", "block", {"reason": (c.data or {}).get("reason")})
         pool.shutdown(wait=False)
         yield {"type": "message", "role": "assistant", "text": REFUSALS[verdict].format(customer=customer)}
@@ -522,10 +568,10 @@ def run_turn(
         return
     yield _done(c.seconds, "✅ Pass", "pass", {"reason": (c.data or {}).get("reason")})
 
-    yield _step("Route", llm.BASE_MODEL)
+    yield _step("Route", backend)
     c = route_future.result()
     pool.shutdown(wait=False)
-    COUNTERS.tokens += c.completion_tokens
+    _record(backend, c.completion_tokens, c.seconds)
     route = (c.data or {}).get("specialist", "spending_analyst")
     follow_up = (c.data or {}).get("follow_up", "").strip()
     # A first question has nothing to resolve, so it is never rewritten.
@@ -549,7 +595,7 @@ def run_turn(
     facts: list[dict[str, Any]] = []
     if route in ("spending_analyst", "product_advisor"):
         agent = _spending_agent if route == "spending_analyst" else _product_agent
-        for event in agent(standalone, session):
+        for event in agent(standalone, session, backend):
             if event["type"] == "facts":
                 facts = event["facts"]
             else:
@@ -560,10 +606,10 @@ def run_turn(
     # The Think hard card runs the writer with thinking on: the scratchpad gets its
     # own row and its own timer, then the draft streams as usual. Everything after
     # this point is identical, thinking or not — the checks see only the draft.
-    yield _step("Thinking" if think_hard else "Draft answer", llm.BASE_MODEL)
+    yield _step("Thinking" if think_hard else "Draft answer", backend)
     draft_started = time.monotonic()
     draft = ""
-    for event in _draft(question, document, session, mode, standalone=standalone,
+    for event in _draft(question, document, session, mode, backend, standalone=standalone,
                         thinking=think_hard):
         if event["type"] == "draft_text":
             draft = event["text"]
@@ -572,18 +618,18 @@ def run_turn(
             yield _done(time.monotonic() - draft_started,
                         f"🧠 thought it through ({words} words)" if words else "🧠 no scratchpad returned",
                         "neutral", {"thinking": event["text"]} if words else None)
-            yield _step("Draft answer", llm.BASE_MODEL)
+            yield _step("Draft answer", backend)
             draft_started = time.monotonic()
         else:
             yield event
     yield _done(time.monotonic() - draft_started, "✍️ Done", "neutral", None)
 
     # 5. Advice check ∥ fact check.
-    yield _step("Advice check", llm.ADVICE_MODEL)
+    yield _step("Advice check", backend, role="advice")
     checks_started = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        advice_future = pool.submit(_advice_check, draft)
-        fact_future = pool.submit(_fact_check, draft, document)
+        advice_future = pool.submit(_advice_check, draft, backend)
+        fact_future = pool.submit(_fact_check, draft, document, backend)
         advice, advice_seconds = advice_future.result()
         verdicts, fact_seconds = fact_future.result()
 
@@ -591,8 +637,10 @@ def run_turn(
     if blocked:
         if mode == "eager":
             COUNTERS.advice_blocked_eager += 1
+            PERF[backend.precision].advice_blocked_eager += 1
         else:
             COUNTERS.advice_blocked_careful += 1
+            PERF[backend.precision].advice_blocked_careful += 1
         yield _done(advice_seconds, "🚫 Blocked", "block", {"reason": advice.get("reason"), "sentence": advice.get("sentence")})
         yield {"type": "draft_blocked", "text": draft, "reason": advice.get("reason", "")}
     else:
@@ -604,7 +652,7 @@ def run_turn(
         yield _done(advice_seconds, text, badge, {"reason": advice.get("reason")})
 
     ungrounded = [v["claim"] for v in verdicts if not v["grounded"]]
-    yield _step("Fact check", llm.JUDGE_MODEL)
+    yield _step("Fact check", backend, role="judge")
     if verdicts:
         ok = len(verdicts) - len(ungrounded)
         yield _done(fact_seconds, f"{'✅' if not ungrounded else '❌'} {ok}/{len(verdicts)} verified",
@@ -613,6 +661,7 @@ def run_turn(
         yield _done(fact_seconds, "no claims to check", "neutral", None)
     if ungrounded:
         COUNTERS.fact_failures += 1
+        PERF[backend.precision].fact_failures += 1
 
     # 6. One rewrite, shared by both checks.
     if blocked or ungrounded:
@@ -625,10 +674,10 @@ def run_turn(
             )
         if ungrounded:
             notes.append("These statements are not supported by the data — fix or remove them: " + " | ".join(ungrounded))
-        yield _step("Rewrite", llm.BASE_MODEL)
+        yield _step("Rewrite", backend)
         rewrite_started = time.monotonic()
         rewritten = ""
-        for event in _draft(question, document, session, "careful", standalone=standalone,
+        for event in _draft(question, document, session, "careful", backend, standalone=standalone,
                             extra="\n\nProblems with your first draft:\n" + "\n".join(notes)):
             if event["type"] == "draft_text":
                 rewritten = event["text"]
@@ -638,10 +687,10 @@ def run_turn(
         draft = rewritten
 
         # Re-check facts once; anything still unsupported is dropped, not retried.
-        verdicts, fact_seconds = _fact_check(draft, document)
+        verdicts, fact_seconds = _fact_check(draft, document, backend)
         still_bad = [v["claim"] for v in verdicts if not v["grounded"]]
         if still_bad:
-            yield _step("Fact check", llm.JUDGE_MODEL)
+            yield _step("Fact check", backend, role="judge")
             kept = [s for s in _sentences(draft) if s not in still_bad]
             draft = " ".join(kept) or "I couldn't verify those numbers, so I'd rather not guess. Try asking a different way."
             yield _done(fact_seconds, f"⚠️ {len(still_bad)} sentence(s) removed", "warn", {"removed": still_bad})
@@ -659,4 +708,5 @@ def run_turn(
     seconds = time.monotonic() - turn_started
     COUNTERS.seconds += seconds
     yield {"type": "message", "role": "assistant", "text": draft, "warning": warning}
+
     yield {"type": "turn_end", "seconds": round(seconds, 2)}

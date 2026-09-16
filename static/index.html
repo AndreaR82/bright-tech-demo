@@ -46,6 +46,13 @@
   }
   .card:hover { border-color: var(--accent); }
   .card.think { border-color: var(--accent); }
+  .thinkrow { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .thinkrow .card { margin: 0 0 6px 0; }
+  .card.toggle { border-color: var(--accent); color: var(--muted); }
+  .card.toggle.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .card.toggle:disabled { opacity: .45; cursor: not-allowed; }
+  .mode-off { opacity: .5; text-decoration: line-through; }
+  .card:disabled { opacity: .5; cursor: default; }
   .row-input { display: flex; gap: 8px; margin-top: 6px; }
   input[type=text] {
     flex: 1; padding: 12px 14px; font-size: 16px; border-radius: 10px;
@@ -142,13 +149,48 @@
     <span id="mode" class="mode-pill">writer: eager</span>
     <span>🔌 no internet</span><span>☁️ $0.00</span>
     <span id="tps">⚡ — tok/s</span>
-    <span id="models">🧠 1 model</span>
+    <span id="precision" class="mode-pill">⚙︎ bf16</span>
   </div>
 </footer>
 
 <script>
 const $ = (id) => document.getElementById(id);
 let currentTurn = null, currentRow = null, timerHandle = null, draftBox = null, thinkBox = null, busy = false;
+
+// Precision is per-question too, for the same reason: the toggle only decides what
+// the next ask() sends, so a click can never split a turn across two backends.
+let precision = 'bf16';
+let fp8Up = false;
+function setPrecision(p) {
+  precision = (p === 'fp8' && fp8Up) ? 'fp8' : 'bf16';
+  const b = $('prectoggle');
+  if (!b) return;
+  const on = precision === 'fp8';
+  b.textContent = on ? '⚡ FP8: on' : '⚡ FP8: off';
+  b.classList.toggle('on', on);
+  b.disabled = !fp8Up;
+  b.setAttribute('aria-pressed', String(on));
+  b.title = fp8Up
+    ? 'Answer with the FP8-quantized model on :8001 instead of bf16 on :8000'
+    : 'The FP8 endpoint (:8001) is not responding';
+}
+
+// Thinking is per-question: the toggle just decides what the next ask() sends.
+let thinkHard = false;
+function setThinkHard(on) {
+  thinkHard = on;
+  const b = $('thinktoggle');
+  if (!b) return;
+  b.textContent = on ? '🧠 Thinking: on' : '🧠 Thinking: off';
+  b.classList.toggle('on', on);
+  b.setAttribute('aria-pressed', String(on));
+}
+
+function setBusy(b) {
+  busy = b;
+  $('send').disabled = b; $('q').disabled = b;
+  if ($('thinktoggle')) $('thinktoggle').disabled = b;
+}
 let idleTimer = null, idleSeconds = 0;   // 0 = auto-clear disabled
 
 function scrollDown(el) { el.scrollTop = el.scrollHeight; }
@@ -286,20 +328,20 @@ function handle(ev) {
       break;
     case 'turn_end':
       if (currentTurn) currentTurn.querySelector('.turn-t').textContent = 'total ' + ev.seconds.toFixed(1) + 's';
-      setTyping(false); busy = false; $('send').disabled = false; $('q').disabled = false;
+      setTyping(false); setBusy(false);
       refreshState(); resetIdle();
       break;
   }
 }
 
-async function ask(question, thinkHard = false) {
+async function ask(question) {
   if (busy || !question.trim()) return;
-  busy = true; $('send').disabled = true; $('q').disabled = true;
+  setBusy(true);
   addBubble(question, 'user');
   $('q').value = '';
   const res = await fetch('/api/ask', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question, think_hard: thinkHard })
+    body: JSON.stringify({ question, think_hard: thinkHard, precision })
   });
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -315,13 +357,36 @@ async function ask(question, thinkHard = false) {
       if (line.startsWith('data:')) handle(JSON.parse(line.slice(5)));
     }
   }
-  busy = false; $('send').disabled = false; $('q').disabled = false;
+  setBusy(false);
+}
+
+// The footer's bf16-vs-FP8 strip. Decode throughput per backend, accumulated all
+// day — the point of the toggle is that you can read the trade-off off the screen
+// rather than take it on trust.
+function renderPrecision(p) {
+  if (!p) return;
+  fp8Up = !!(p.available && p.available.fp8 && p.available.fp8.ok);
+  setPrecision(precision);            // re-disables the pill if :8001 went away
+  const st = p.stats || {};
+  const rate = n => (st[n] && st[n].tok_s) || 0;
+  const parts = ['bf16', 'fp8'].map(n => {
+    const v = rate(n) ? rate(n).toFixed(1) : '—';
+    return n === precision ? `<b>${n} ${v}</b>` : `${n} ${v}`;
+  });
+  let line = '⚡ ' + parts.join(' · ') + ' tok/s';
+  if (rate('bf16') && rate('fp8')) {
+    const d = Math.round((rate('fp8') / rate('bf16') - 1) * 100);
+    line += ` (${d >= 0 ? '+' : ''}${d}%)`;
+  }
+  $('tps').innerHTML = line;
+  $('precision').textContent = '⚙︎ ' + precision;
+  $('precision').className = 'mode-pill mode-' + (fp8Up ? precision : 'off');
 }
 
 async function refreshState() {
   const s = await (await fetch('/api/state')).json();
   $('bankname').textContent = s.bank_name + ' · ' + s.customer_name + ' · rates as at ' + s.rates_as_at;
-  $('tps').textContent = '⚡ ' + (s.counters.tokens_per_second || '—') + ' tok/s';
+  renderPrecision(s.precision);
   $('mode').textContent = 'writer: ' + s.mode;
   $('mode').className = 'mode-pill mode-' + s.mode;
   idleSeconds = s.idle_reset_seconds;
@@ -355,10 +420,24 @@ function renderCards(s) {
     }
     host.appendChild(div);
   }
+  const row = document.createElement('div');
+  row.className = 'thinkrow';
+  const toggle = document.createElement('button');
+  toggle.className = 'card toggle'; toggle.id = 'thinktoggle';
+  toggle.title = 'Run the writer with Gemma\'s thinking mode on (slower; the scratchpad shows in the trace)';
+  toggle.onclick = () => setThinkHard(!thinkHard);
+  row.appendChild(toggle);
+  const prec = document.createElement('button');
+  prec.className = 'card toggle'; prec.id = 'prectoggle';
+  prec.onclick = () => setPrecision(precision === 'fp8' ? 'bf16' : 'fp8');
+  row.appendChild(prec);
   const think = document.createElement('button');
   think.className = 'card think'; think.textContent = '🧠 Think hard: ' + s.think_hard_card;
-  think.onclick = () => ask(s.think_hard_card, true);
-  host.appendChild(think);
+  think.onclick = () => { setThinkHard(true); ask(s.think_hard_card); };
+  row.appendChild(think);
+  host.appendChild(row);
+  setThinkHard(thinkHard);
+  setPrecision(precision);
 }
 
 function resetIdle() {
@@ -371,6 +450,7 @@ async function newVisitor() {
   await fetch('/api/reset', { method: 'POST' });
   $('messages').innerHTML = ''; $('steps').innerHTML = '';
   currentTurn = null; draftBox = null;
+  setThinkHard(false);          // the next visitor starts on the fast path
   refreshState();
 }
 

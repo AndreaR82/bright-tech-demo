@@ -1,0 +1,50 @@
+scoring 224 held-out drafts
+endpoint: http://localhost:8000/v1 (bf16)
+  base Gemma 4 E4B (bf16, zero-shot): 20/224
+  base Gemma 4 E4B (bf16, zero-shot): 40/224
+  base Gemma 4 E4B (bf16, zero-shot): 60/224
+  base Gemma 4 E4B (bf16, zero-shot): 80/224
+  base Gemma 4 E4B (bf16, zero-shot): 100/224
+  base Gemma 4 E4B (bf16, zero-shot): 120/224
+  base Gemma 4 E4B (bf16, zero-shot): 140/224
+  base Gemma 4 E4B (bf16, zero-shot): 160/224
+  base Gemma 4 E4B (bf16, zero-shot): 180/224
+  base Gemma 4 E4B (bf16, zero-shot): 200/224
+  base Gemma 4 E4B (bf16, zero-shot): 220/224
+  Gemma 4 E4B bf16 + advice-LoRA: 20/224
+  Gemma 4 E4B bf16 + advice-LoRA: 40/224
+  Gemma 4 E4B bf16 + advice-LoRA: 60/224
+  Gemma 4 E4B bf16 + advice-LoRA: 80/224
+  Gemma 4 E4B bf16 + advice-LoRA: 100/224
+  Gemma 4 E4B bf16 + advice-LoRA: 120/224
+  Gemma 4 E4B bf16 + advice-LoRA: 140/224
+  Gemma 4 E4B bf16 + advice-LoRA: 160/224
+  Gemma 4 E4B bf16 + advice-LoRA: 180/224
+  Gemma 4 E4B bf16 + advice-LoRA: 200/224
+  Gemma 4 E4B bf16 + advice-LoRA: 220/224
+
+=== base Gemma 4 E4B (bf16, zero-shot) ===
+accuracy           0.955
+balanced accuracy  0.876
+  recall factual_information            0.995
+  recall personalised_recommendation    0.757  ← the one that matters
+  accuracy on neutral_open             0.727  (n=11)
+  accuracy on original                 0.977  (n=177)
+  accuracy on prefix_factual           1.000  (n=10)
+  accuracy on referral_personal        0.833  (n=12)
+  accuracy on steer_removed            0.929  (n=14)
+
+=== Gemma 4 E4B bf16 + advice-LoRA ===
+accuracy           0.991
+balanced accuracy  0.984
+  recall factual_information            0.995
+  recall personalised_recommendation    0.973  ← the one that matters
+  accuracy on neutral_open             0.909  (n=11)
+  accuracy on original                 1.000  (n=177)
+  accuracy on prefix_factual           1.000  (n=10)
+  accuracy on referral_personal        1.000  (n=12)
+  accuracy on steer_removed            0.929  (n=14)
+
+Δ balanced accuracy +0.108
+missed recommendations: base 24.3% → LoRA 2.7%
+verdict: ship the adapter

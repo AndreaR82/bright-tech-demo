@@ -11,6 +11,10 @@ at a bank event.
     # both, once the adapter is served:
     #   vllm serve ... --enable-lora --lora-modules advice=outputs/gemma4-e4b-advice
     uv run python scripts/eval_advice.py --adapter advice
+
+    # the same drafts through the FP8 endpoint, to see what quantization costs
+    # the detector — the number behind the booth's bf16/FP8 toggle
+    uv run python scripts/eval_advice.py --adapter advice --precision fp8
 """
 
 from __future__ import annotations
@@ -30,16 +34,16 @@ TEST = ROOT / "data" / "processed" / "advice_test.jsonl"
 LABELS = ["factual_information", "personalised_recommendation"]
 
 
-def classify(draft: str, model: str) -> str:
+def classify(draft: str, model: str, backend: llm.Backend) -> str:
     c = llm.complete(
         [{"role": "system", "content": pipeline._prompt("advice_check")},
          {"role": "user", "content": f"Draft reply:\n{draft}"}],
-        model=model, schema=pipeline.ADVICE_SCHEMA, max_tokens=160,
+        model=model, backend=backend, schema=pipeline.ADVICE_SCHEMA, max_tokens=160,
     )
     return (c.data or {}).get("label", "factual_information")
 
 
-def score(rows: list[dict], model: str, name: str) -> dict:
+def score(rows: list[dict], model: str, name: str, backend: llm.Backend) -> dict:
     correct = 0
     per_label_total: dict[str, int] = defaultdict(int)
     per_label_hit: dict[str, int] = defaultdict(int)
@@ -50,7 +54,7 @@ def score(rows: list[dict], model: str, name: str) -> dict:
 
     for i, row in enumerate(rows, 1):
         gold = row["label"]
-        pred = classify(row["draft"], model)
+        pred = classify(row["draft"], model, backend)
         per_label_total[gold] += 1
         confusion[(gold, pred)] += 1
         if pred == gold:
@@ -88,8 +92,19 @@ def report(result: dict) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--adapter", default=None, help="served LoRA name, e.g. 'advice'")
+    ap.add_argument("--precision", default="bf16", choices=sorted(llm.BACKENDS),
+                    help="which vLLM endpoint to score against (default bf16)")
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
+
+    backend = llm.resolve(args.precision)
+    probe = llm.availability(max_age=0.0)[args.precision]
+    if not probe["ok"]:
+        # Silently scoring bf16 while the report says fp8 would be worse than failing.
+        sys.exit(f"{args.precision} endpoint at {backend.base_url} is not responding: {probe.get('error')}")
+    if args.adapter and args.adapter not in probe["models"]:
+        sys.exit(f"{backend.base_url} does not serve a LoRA called {args.adapter!r} "
+                 f"(it serves {probe['models']})")
 
     if not TEST.exists():
         sys.exit(f"no test split at {TEST} — run scripts/build_train_data.py first")
@@ -98,9 +113,13 @@ def main() -> int:
         rows = rows[: args.limit]
     print(f"scoring {len(rows)} held-out drafts")
 
-    results = [score(rows, llm.BASE_MODEL, "base Gemma 4 E4B (zero-shot)")]
+    print(f"endpoint: {backend.base_url} ({args.precision})")
+    # The precision goes in the result name: two runs' reports are otherwise
+    # indistinguishable, and this one exists to be compared against another.
+    results = [score(rows, backend.model, f"base Gemma 4 E4B ({args.precision}, zero-shot)", backend)]
     if args.adapter:
-        results.append(score(rows, args.adapter, f"Gemma 4 E4B + {args.adapter}-LoRA"))
+        results.append(score(rows, args.adapter,
+                             f"Gemma 4 E4B {args.precision} + {args.adapter}-LoRA", backend))
 
     for result in results:
         report(result)

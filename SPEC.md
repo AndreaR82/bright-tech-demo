@@ -19,7 +19,9 @@ readable by both.
 
 - DGX Spark **on the booth table**, visible, **no internet**.
 - One station: computer monitor + keyboard, **one visitor at a time**.
-- Presenter (you) narrates; discreet presenter controls only (no visitor toggles).
+- Presenter (you) narrates; discreet presenter controls only, with one exception:
+  the ⚡ FP8 pill is visitor-clickable, because the speed/quality trade-off is
+  something people want to feel for themselves rather than be told about.
 
 ## The screen
 
@@ -37,8 +39,9 @@ readable by both.
 - Trace rows are **persistent**: `Step | Model | Time | Outcome`, coloured
   badges (green pass / red blocked / amber warning / blue for neutral and
   non-AI steps).
-- The `Model` column carries the LoRA story (`Gemma 4B`, `Gemma 4B + judge-LoRA`,
-  `—` for non-AI steps like SQL and the calculator).
+- The `Model` column carries the precision and LoRA story (`Gemma 4B bf16`,
+  `Gemma 4B FP8 + advice-LoRA`, `—` for non-AI steps like SQL and the
+  calculator), so a turn's trace says which of the two endpoints answered it.
 - Current turn expanded at top; older turns collapse to one line. Chat bubbles
   and the input are 16px; the trace table runs 12.5–14px.
 - **No simple/engineer toggle.** One view for everyone.
@@ -140,7 +143,15 @@ fallback replay for a mid-event vLLM death is still to be built.
 specialists + tools → three guardrails → 9 cards → end-to-end demo.
 **Day 2 am** — booth memory, counters, reset, preflight, recording fallback,
 speed pass. **Day 2 pm** — you test with 2–3 colleagues, I fix what they find.
-Stretch, in order: EmbeddingGemma, FP8/speculative decoding.
+Stretch, in order: EmbeddingGemma, speculative decoding.
+
+FP8 is done: a second vLLM server on :8001 holds the same weights and the same
+advice adapter quantized to FP8, and the ⚡ pill picks between them per question.
+Measured at batch size 1, 128 tokens, after warm-up, on an otherwise idle box:
+**bf16 19.1 tok/s → FP8 35.6 tok/s (1.86x)** on the base model, and **18.2 → 33.2
+(1.82x)** with the advice adapter loaded. Quantizable linears are only 49% of the
+checkpoint — the per-layer embedding tables are another 36% and do not quantize —
+so ~1.8x is the ceiling here, not 2x. See README for the launch flags.
 
 ## Advice-detector fine-tune
 
